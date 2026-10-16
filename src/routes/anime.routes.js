@@ -140,11 +140,26 @@ router.get(
       throw new ApiError(400, "Se requiere el parametro url o urls");
     }
 
+    function isDirectStream(directUrl, originalUrl) {
+      if (!directUrl || typeof directUrl !== "string") return false;
+      const isEmbedOrPage = /videoembed|\/embed|player\.php|embed\.php|embed-|mega\.nz|mediafire\.com|1fichier\.com|zippyshare\.com|\.html(?:\?|$)/i.test(directUrl);
+      if (isEmbedOrPage) {
+        return false;
+      }
+      const hasExt = /\.(?:m3u8|mp4|webm)(?:\?|#|$)/i.test(directUrl);
+      if (hasExt) {
+        return true;
+      }
+      if (directUrl !== originalUrl && (directUrl.includes(".m3u8") || directUrl.includes(".mp4") || directUrl.includes("/delivery/"))) {
+        return true;
+      }
+      return false;
+    }
+
     const resolvePromises = urls.map(async (url) => {
       try {
         const directUrl = await resolveEmbedUrl(url);
-        const isVideo = directUrl && (isLikelyVideoUrl(directUrl) || /\.(?:m3u8|mp4)(?:\?|#|$)/i.test(directUrl));
-        if (directUrl && (directUrl !== url || isVideo)) {
+        if (directUrl && isDirectStream(directUrl, url)) {
           let server = "unknown";
           const lower = (url + " " + directUrl).toLowerCase();
           if (lower.includes("voe")) server = "voe";
@@ -158,11 +173,8 @@ router.get(
           else if (lower.includes("mp4upload")) server = "mp4upload";
           else if (lower.includes("filemoon")) server = "filemoon";
           else if (lower.includes("hqq") || lower.includes("waaw") || lower.includes("netu")) server = "hqq";
-          else if (lower.includes("ok.ru") || lower.includes("okru")) server = "okru";
           else if (lower.includes("pdrain") || lower.includes("pixeldrain")) server = "pixeldrain";
-          else if (lower.includes("1fichier")) server = "1fichier";
           else if (lower.includes("zilla") || lower.includes("hls")) server = "hls";
-          else if (lower.includes("mega")) server = "mega";
 
           return {
             success: true,

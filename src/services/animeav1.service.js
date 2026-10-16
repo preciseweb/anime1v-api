@@ -922,7 +922,11 @@ async function searchAnime(query, domainCandidate) {
 async function getEpisodeLinks(urlCandidate, includeMegaRaw, excludeServersRaw) {
   const normalizedUrl = normalizeInputUrl(urlCandidate);
   const domain = detectDomain(normalizedUrl);
-  const includeMega = parseBoolean(includeMegaRaw);
+  const includeMega =
+    includeMegaRaw === undefined ||
+    includeMegaRaw === null ||
+    String(includeMegaRaw).toLowerCase() === "true" ||
+    includeMegaRaw === true;
   const excludedTokens = buildExcludedTokens(includeMega, excludeServersRaw);
 
   const html = await fetchHtml(urlCandidate);
@@ -937,6 +941,20 @@ async function getEpisodeLinks(urlCandidate, includeMegaRaw, excludeServersRaw) 
   const filteredDownloadSub = filterLinksByServers(links.download.SUB, excludedTokens);
   const filteredDownloadDub = filterLinksByServers(links.download.DUB, excludedTokens);
 
+  const allSub = [...filteredStreamSub];
+  for (const dl of filteredDownloadSub) {
+    if (!allSub.some((s) => s.url === dl.url)) {
+      allSub.push(dl);
+    }
+  }
+
+  const allDub = [...filteredStreamDub];
+  for (const dl of filteredDownloadDub) {
+    if (!allDub.some((s) => s.url === dl.url)) {
+      allDub.push(dl);
+    }
+  }
+
   return {
     success: true,
     data: {
@@ -948,13 +966,13 @@ async function getEpisodeLinks(urlCandidate, includeMegaRaw, excludeServersRaw) 
       title: episodeObject.title || `Episodio ${parseEpisodeNumberFromUrl(normalizedUrl) || "?"}`,
       season: episodeObject.season ?? null,
       variants: {
-        SUB: filteredStreamSub.length > 0 || filteredDownloadSub.length > 0 ? 1 : 0,
-        DUB: filteredStreamDub.length > 0 || filteredDownloadDub.length > 0 ? 1 : 0,
+        SUB: allSub.length > 0 ? 1 : 0,
+        DUB: allDub.length > 0 ? 1 : 0,
       },
       publishedAt: episodeObject.publishedAt || episodeObject.published_at || null,
       servers: {
-        sub: sanitizeLinksForResponse(filteredStreamSub),
-        dub: sanitizeLinksForResponse(filteredStreamDub),
+        sub: sanitizeLinksForResponse(allSub),
+        dub: sanitizeLinksForResponse(allDub),
       },
       streamLinks: {
         SUB: sanitizeLinksForResponse(filteredStreamSub),

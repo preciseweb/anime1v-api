@@ -952,9 +952,7 @@ body {
 }
 
 .server-btn.server-failed {
-  opacity: 0.35;
-  text-decoration: line-through;
-  pointer-events: none;
+  opacity: 0.6;
 }
 
 .server-btn.server-trying {

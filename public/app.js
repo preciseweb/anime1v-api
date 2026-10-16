@@ -522,10 +522,11 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // Resolución multi-servidor en cascada:
-  // Recopila TODOS los servidores soportados y envía sus URLs al backend.
-  // El backend los prueba en orden y devuelve el primer resultado exitoso.
+  // Resolución multi-servidor en cascada:
+  // Recopila los servidores con extractor nativo sin anuncios y los prueba.
+  // Si no hay o fallan, carga directamente el mejor reproductor disponible.
   async function resolveMultiServer(servers) {
-    // Identificar servidores soportados (que tienen resolutor nativo)
+    // Identificar servidores con resolutor nativo directo (streaming limpio sin anuncios)
     const supportedServers = servers.filter(s => {
       const n = ((s.server || '') + ' ' + (s.url || '')).toLowerCase();
       return (
@@ -535,38 +536,33 @@ document.addEventListener('DOMContentLoaded', () => {
         n.includes('playnix') ||
         n.includes('medix') ||
         n.includes('awish') ||
+        n.includes('sfastwish') ||
         n.includes('vidhide') ||
         n.includes('mixdrop') ||
         n.includes('dood') ||
         n.includes('dropload') ||
-        n.includes('yourupload') ||
-        n.includes('mp4upload') ||
         n.includes('filemoon') ||
-        n.includes('okru') ||
-        n.includes('ok.ru') ||
-        n.includes('hqq') ||
-        n.includes('netu') ||
-        n.includes('waaw') ||
-        n.includes('pixeldrain') ||
-        n.includes('pdrain') ||
-        n.includes('1fichier') ||
-        n.includes('upnshare') ||
-        n.includes('upstream') ||
-        n.includes('.mp4') ||
-        n.includes('.m3u8')
+        n.includes('.m3u8') ||
+        n.includes('.mp4')
       );
     });
 
-    // Renderizar TODOS los botones de servidor (soportados + no soportados)
+    // Renderizar TODOS los botones de servidor
     renderAllServerButtons(servers, supportedServers);
 
     if (supportedServers.length === 0) {
-      // Sin servidores soportados: ir directo a iframe con el primero disponible
+      // Sin servidores de extracción directa: usar el primer reproductor disponible
       if (servers.length > 0) {
-        playingSubtitle.textContent = `Reproduciendo Episodio ${currentEpisodeNumber} (Iframe: ${servers[0].server})`;
-        loadIframePlayer(servers[0].url);
+        const primaryServer = servers.find(s => !s.url.includes('download') && !s.url.includes('zippyshare') && !s.url.includes('mediafire')) || servers[0];
+        playingSubtitle.textContent = `Reproduciendo Episodio ${currentEpisodeNumber} (${primaryServer.server})`;
+        const primaryIdx = servers.indexOf(primaryServer);
+        if (primaryIdx !== -1) {
+          const btn = document.querySelector(`.server-btn[data-idx="${primaryIdx}"]`);
+          if (btn) btn.classList.add('active');
+        }
+        loadIframePlayer(primaryServer.url);
       } else {
-        videoLoader.innerHTML = '<p>No hay reproductores disponibles.</p>';
+        videoLoader.innerHTML = '<p>No hay reproductores disponibles para este episodio.</p>';
       }
       return;
     }
@@ -574,18 +570,16 @@ document.addEventListener('DOMContentLoaded', () => {
     // Mostrar progreso visual
     videoLoader.innerHTML = `
       <div class="spinner"></div>
-      <p>Probando ${supportedServers.length} servidor${supportedServers.length > 1 ? 'es' : ''} en cascada para encontrar el mejor stream sin anuncios...</p>
+      <p>Buscando el mejor stream sin anuncios...</p>
     `;
     videoLoader.style.opacity = '1';
     videoLoader.style.pointerEvents = 'all';
 
-    // Marcar todos como "trying" visualmente
-    supportedServers.forEach((s, i) => {
-      const btn = document.querySelector(`.server-btn[data-idx="${servers.indexOf(s)}"]`);
-      if (btn && i === 0) btn.classList.add('server-trying');
-    });
+    // Marcar el primero como intentando
+    const firstBtn = document.querySelector(`.server-btn[data-idx="${servers.indexOf(supportedServers[0])}"]`);
+    if (firstBtn) firstBtn.classList.add('server-trying');
 
-    // Enviar TODOS los URLs soportados al backend para cascada
+    // Enviar URLs soportadas al backend para cascada
     const urlsArray = supportedServers.map(s => s.url);
 
     try {
@@ -603,7 +597,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const streamUrl = responseData.streamUrl;
         const mediaType = responseData.mediaType;
         const resolvedFrom = responseData.resolvedFrom || '';
-        
+
         // Marcar el servidor exitoso como activo
         const winnerIdx = servers.findIndex(s => s.url === resolvedFrom);
         if (winnerIdx !== -1) {
@@ -611,72 +605,65 @@ document.addEventListener('DOMContentLoaded', () => {
           if (winBtn) winBtn.classList.add('active');
         }
 
-        // Marcar los que fallaron (los que están antes del ganador en la lista soportada)
-        const winnerSupportedIdx = supportedServers.findIndex(s => s.url === resolvedFrom);
-        for (let i = 0; i < winnerSupportedIdx; i++) {
-          const failIdx = servers.indexOf(supportedServers[i]);
-          const failBtn = document.querySelector(`.server-btn[data-idx="${failIdx}"]`);
-          if (failBtn) failBtn.classList.add('server-failed');
-        }
-
         console.log(`[CASCADA] Stream resuelto exitosamente desde: ${resolvedFrom}`);
         playingSubtitle.textContent = `Streaming Directo Limpio (${responseData.server}) — Capítulo ${currentEpisodeNumber}`;
-        
+
         videoLoader.style.opacity = '0';
         videoLoader.style.pointerEvents = 'none';
 
-        startVideoPlayer(streamUrl, mediaType, servers[0]?.url);
+        startVideoPlayer(streamUrl, mediaType, resolvedFrom || supportedServers[0]?.url);
       } else {
-        throw new Error("Cascada agotada — ningún servidor devolvió stream");
+        throw new Error("Cascada agotada");
       }
     } catch (err) {
-      console.warn(`[CASCADA] Todos los servidores fallaron:`, err.message);
-      
-      // Marcar todos los soportados como fallidos
+      console.warn(`[CASCADA] Servidores directos no disponibles, usando reproductor alternativo:`, err.message);
+
       document.querySelectorAll('.server-btn').forEach(b => {
         b.classList.remove('server-trying');
       });
-      supportedServers.forEach(s => {
-        const idx = servers.indexOf(s);
-        const btn = document.querySelector(`.server-btn[data-idx="${idx}"]`);
-        if (btn) btn.classList.add('server-failed');
-      });
 
-      // Fallback: cargar el primer servidor disponible en iframe
-      playingSubtitle.textContent = `Reproduciendo Episodio ${currentEpisodeNumber} (Iframe de Respaldo)`;
-      loadIframePlayer(servers[0].url);
+      // Fallback suave: buscar el primer reproductor válido
+      const fallbackServer = servers.find(s => !s.url.includes('zilla') && !s.url.includes('download') && !s.url.includes('zippyshare') && !s.url.includes('mediafire')) || servers[0];
+      if (fallbackServer) {
+        playingSubtitle.textContent = `Reproduciendo Episodio ${currentEpisodeNumber} (${fallbackServer.server})`;
+        const fallbackIdx = servers.indexOf(fallbackServer);
+        if (fallbackIdx !== -1) {
+          const fbBtn = document.querySelector(`.server-btn[data-idx="${fallbackIdx}"]`);
+          if (fbBtn) fbBtn.classList.add('active');
+        }
+        loadIframePlayer(fallbackServer.url);
+      }
     }
   }
 
   // Renderizar la lista de botones de servidor
   function renderAllServerButtons(allServers, supportedServers) {
     serversList.innerHTML = '';
-    
+
     allServers.forEach((s, idx) => {
       const isSupported = supportedServers.includes(s);
       const btn = document.createElement('button');
       btn.className = 'server-btn';
       btn.setAttribute('data-idx', idx);
-      
+
       if (isSupported) {
         btn.innerHTML = `<i class="fa-solid fa-bolt"></i> ${s.server} (Sin Anuncios)`;
       } else {
-        btn.innerHTML = `<i class="fa-solid fa-external-link"></i> ${s.server} (Iframe)`;
+        btn.innerHTML = `<i class="fa-solid fa-play"></i> ${s.server}`;
       }
-      
+
       btn.addEventListener('click', () => {
-        // Clic manual: resolver este servidor individual
         document.querySelectorAll('.server-btn').forEach(b => b.classList.remove('active', 'server-trying'));
         btn.classList.add('active');
-        
+
         if (isSupported) {
           resolveSingleServer(s.url, s.server);
         } else {
-          playingSubtitle.textContent = `Reproduciendo Episodio ${currentEpisodeNumber} (Iframe: ${s.server})`;
+          playingSubtitle.textContent = `Reproduciendo Episodio ${currentEpisodeNumber} (${s.server})`;
           loadIframePlayer(s.url);
         }
       });
-      
+
       serversList.appendChild(btn);
     });
   }
@@ -685,7 +672,7 @@ document.addEventListener('DOMContentLoaded', () => {
   async function resolveSingleServer(embedUrl, serverName) {
     videoLoader.innerHTML = `
       <div class="spinner"></div>
-      <p>Resolviendo enlace nativo de <strong>${serverName}</strong>...</p>
+      <p>Resolviendo enlace de <strong>${serverName}</strong>...</p>
     `;
     videoLoader.style.opacity = '1';
     videoLoader.style.pointerEvents = 'all';
@@ -700,7 +687,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (responseData.success && responseData.streamUrl) {
         console.log(`[STREAMING] Enlace directo resuelto: ${responseData.streamUrl}`);
         playingSubtitle.textContent = `Streaming Directo (${serverName}) — Capítulo ${currentEpisodeNumber}`;
-        
+
         videoLoader.style.opacity = '0';
         videoLoader.style.pointerEvents = 'none';
         startVideoPlayer(responseData.streamUrl, responseData.mediaType, embedUrl);
@@ -708,8 +695,8 @@ document.addEventListener('DOMContentLoaded', () => {
         throw new Error("No se devolvió un enlace válido");
       }
     } catch (err) {
-      console.warn(`[RESOLVER] Falló resolución de ${serverName}:`, err.message);
-      playingSubtitle.textContent = `Reproduciendo Episodio ${currentEpisodeNumber} (Iframe: ${serverName})`;
+      console.warn(`[RESOLVER] Falló resolución directa de ${serverName}, cargando reproductor:`, err.message);
+      playingSubtitle.textContent = `Reproduciendo Episodio ${currentEpisodeNumber} (${serverName})`;
       loadIframePlayer(embedUrl);
     }
   }
