@@ -402,19 +402,33 @@ function parseAnimeInfoFromHtml(html, domain) {
   };
 }
 
+function extractUrlFromEmbed(val) {
+  if (!val || typeof val !== "string") return val;
+  const iframeMatch = val.match(/src=["']([^"']+)["']/i);
+  if (iframeMatch && iframeMatch[1]) {
+    return iframeMatch[1];
+  }
+  return val;
+}
+
 function parseEpisodesFromHtml(html, domain, slug) {
   const $ = cheerio.load(html);
   const episodes = [];
 
-  $("a[href^='/ver/'], a[href*='/ver/']").each((_, element) => {
+  $("#episodeList a, ul.ListEpisodios a, a[href^='/ver/'], a[href*='/ver/']").each((_, element) => {
     const link = $(element).attr("href");
     if (!link) {
       return;
     }
 
+    // STRICT CHECK: Ensure the link matches this anime's slug to avoid picking up sidebar episodes of other animes!
+    if (slug && !link.includes(`/ver/${slug}-`)) {
+      return;
+    }
+
     const url = resolveAbsoluteUrl(link, domain);
     const number = parseEpisodeNumberFromUrl(url);
-    if (!number) {
+    if (!number && number !== 0) {
       return;
     }
 
@@ -492,11 +506,12 @@ function parseVideoSources(html) {
 
       for (const urlField of ["code", "url", "embed", "file"]) {
         if (entry[urlField] && typeof entry[urlField] === "string") {
-          const decoded = tryDecodeBase64(entry[urlField]);
+          const raw = extractUrlFromEmbed(entry[urlField]);
+          const decoded = tryDecodeBase64(raw);
           if (decoded) {
             entry[urlField] = decoded;
           } else {
-            entry[urlField] = decodeUrlEscapes(entry[urlField]);
+            entry[urlField] = decodeUrlEscapes(raw);
           }
         }
       }
@@ -579,12 +594,27 @@ async function getAnimeInfo(urlCandidate) {
   const baseUrl = `https://${domain}/anime/${slug}`;
   const html = await fetchHtml(baseUrl);
 
-  const info = parseAnimeInfoFromHtml(html, domain);
-  let episodes = parseEpisodesFromHtml(html, domain, slug);
-
-  if (episodes.length === 0) {
-    episodes = parseEpisodeListFromScript(html, domain, slug);
+  // Try to extract canonical slug from anime_info script if present
+  const animeInfoLiteral = extractVarLiteral(html, "anime_info");
+  if (animeInfoLiteral) {
+    const animeInfoArr = safeEvaluate(`(${animeInfoLiteral})`);
+    if (Array.isArray(animeInfoArr) && animeInfoArr[2]) {
+      slug = animeInfoArr[2];
+    }
   }
+
+  const info = parseAnimeInfoFromHtml(html, domain);
+
+  // 1. Primary source: real episodes list defined in script by AnimeFLV
+  let episodes = parseEpisodeListFromScript(html, domain, slug);
+
+  // 2. Fallback to HTML only if script was empty
+  if (episodes.length === 0) {
+    episodes = parseEpisodesFromHtml(html, domain, slug);
+  }
+
+  // Sort episodes ascending by number
+  episodes.sort((a, b) => (a.number || 0) - (b.number || 0));
 
   return {
     success: true,
@@ -616,32 +646,60 @@ async function getEpisodeLinks(urlCandidate, includeMegaRaw, excludeServersRaw) 
   const normalizedUrl = normalizeInputUrl(urlCandidate);
   const parsedEpUrl = new URL(normalizedUrl);
   const epDomain = parsedEpUrl.hostname || DEFAULT_DOMAIN;
-  const includeMega = String(includeMegaRaw).toLowerCase() === "true";
+  const includeMega = includeMegaRaw !== false && String(includeMegaRaw).toLowerCase() !== "false";
   const excludedTokens = buildExcludedTokens(includeMega, excludeServersRaw);
 
   const html = await fetchHtml(normalizedUrl);
+
+  const isUrlDub =
+    normalizedUrl.includes("audio-latino") ||
+    normalizedUrl.includes("-latino") ||
+    normalizedUrl.includes("-dub");
 
   const streamLinks = { SUB: [], DUB: [] };
   const downloadLinks = { SUB: [], DUB: [] };
 
   const videoSources = parseVideoSources(html);
   if (videoSources && typeof videoSources === "object") {
-    for (const [key, entries] of Object.entries(videoSources)) {
-      const variant = normalizeVariantKey(key);
-      if (!Array.isArray(entries)) {
-        continue;
-      }
-
-      for (const entry of entries) {
-        if (!entry) {
+    if (Array.isArray(videoSources)) {
+      videoSources.forEach((entries, idx) => {
+        const variant = isUrlDub || idx === 1 ? "DUB" : "SUB";
+        if (Array.isArray(entries)) {
+          for (const entry of entries) {
+            if (!entry) continue;
+            const url = extractUrlFromEmbed(entry.code || entry.url || entry.embed || entry.file || null);
+            const serverName = entry.title || entry.server || "Unknown";
+            const sName = (serverName + " " + (entry.title || "")).toLowerCase();
+            const isDub = variant === "DUB" || sName.includes("lat") || sName.includes("dub") || sName.includes("esp");
+            const finalVariant = isDub ? "DUB" : "SUB";
+            const link = buildLinkRecord(serverName, url, null);
+            if (link) {
+              pushDeduped(streamLinks[finalVariant], link);
+            }
+          }
+        }
+      });
+    } else {
+      for (const [key, entries] of Object.entries(videoSources)) {
+        const variant = isUrlDub ? "DUB" : normalizeVariantKey(key);
+        if (!Array.isArray(entries)) {
           continue;
         }
 
-        const url = entry.code || entry.url || entry.embed || entry.file || null;
-        const serverName = entry.title || entry.server || "Unknown";
-        const link = buildLinkRecord(serverName, url, null);
-        if (link) {
-          pushDeduped(streamLinks[variant], link);
+        for (const entry of entries) {
+          if (!entry) {
+            continue;
+          }
+
+          const url = extractUrlFromEmbed(entry.code || entry.url || entry.embed || entry.file || null);
+          const serverName = entry.title || entry.server || "Unknown";
+          const sName = (serverName + " " + (entry.title || "")).toLowerCase();
+          const isDub = variant === "DUB" || sName.includes("lat") || sName.includes("dub") || sName.includes("esp");
+          const finalVariant = isDub ? "DUB" : "SUB";
+          const link = buildLinkRecord(serverName, url, null);
+          if (link) {
+            pushDeduped(streamLinks[finalVariant], link);
+          }
         }
       }
     }
@@ -649,7 +707,8 @@ async function getEpisodeLinks(urlCandidate, includeMegaRaw, excludeServersRaw) 
 
   const downloadRows = parseDownloadRows(html, epDomain);
   for (const row of downloadRows) {
-    const variant = normalizeVariantKey(row.variant);
+    const isRowDub = isUrlDub || (row.variant && /lat|dub|esp/i.test(row.variant));
+    const variant = isRowDub ? "DUB" : normalizeVariantKey(row.variant);
     const link = buildLinkRecord(row.server || "Download", row.url, row.format || null);
     if (link) {
       pushDeduped(downloadLinks[variant], link);
@@ -660,6 +719,21 @@ async function getEpisodeLinks(urlCandidate, includeMegaRaw, excludeServersRaw) 
   const filteredStreamDub = filterLinksByServers(streamLinks.DUB, excludedTokens);
   const filteredDownloadSub = filterLinksByServers(downloadLinks.SUB, excludedTokens);
   const filteredDownloadDub = filterLinksByServers(downloadLinks.DUB, excludedTokens);
+
+  // Combine stream and download servers into servers list so users see all available servers
+  const allSubServers = [...filteredStreamSub];
+  for (const dl of filteredDownloadSub) {
+    if (!allSubServers.some((s) => s.url === dl.url)) {
+      allSubServers.push(dl);
+    }
+  }
+
+  const allDubServers = [...filteredStreamDub];
+  for (const dl of filteredDownloadDub) {
+    if (!allDubServers.some((s) => s.url === dl.url)) {
+      allDubServers.push(dl);
+    }
+  }
 
   const episodeNumber = parseEpisodeNumberFromUrl(normalizedUrl);
   const title = cheerio.load(html)("h1").first().text().trim() || null;
@@ -672,13 +746,13 @@ async function getEpisodeLinks(urlCandidate, includeMegaRaw, excludeServersRaw) 
       title: title || `Episodio ${episodeNumber || "?"}`,
       season: null,
       variants: {
-        SUB: filteredStreamSub.length > 0 || filteredDownloadSub.length > 0 ? 1 : 0,
-        DUB: filteredStreamDub.length > 0 || filteredDownloadDub.length > 0 ? 1 : 0,
+        SUB: allSubServers.length > 0 ? 1 : 0,
+        DUB: allDubServers.length > 0 ? 1 : 0,
       },
       publishedAt: null,
       servers: {
-        sub: sanitizeLinksForResponse(filteredStreamSub),
-        dub: sanitizeLinksForResponse(filteredStreamDub),
+        sub: sanitizeLinksForResponse(allSubServers),
+        dub: sanitizeLinksForResponse(allDubServers),
       },
       streamLinks: {
         SUB: sanitizeLinksForResponse(filteredStreamSub),

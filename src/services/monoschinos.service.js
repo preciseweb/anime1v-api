@@ -169,6 +169,7 @@ async function getAnimeInfo(urlCandidate) {
     $("a[href*='/ver/']").each((_, el) => {
       const href = $(el).attr("href");
       if (!href) return;
+      if (slug && !href.includes(slug)) return;
       const fullUrl = href.startsWith("http") ? href : `https://${domain}${href}`;
       const number = parseEpisodeNumberFromUrl(fullUrl);
       if (number) {
@@ -218,7 +219,7 @@ async function getAnimeInfo(urlCandidate) {
   };
 }
 
-async function getEpisodeLinks(urlCandidate, includeMega = false, excludeServers = []) {
+async function getEpisodeLinks(urlCandidate, includeMegaRaw = true, excludeServers = []) {
   const slug = slugFromUrl(urlCandidate);
   const episodeNumber = parseEpisodeNumberFromUrl(urlCandidate);
 
@@ -226,14 +227,26 @@ async function getEpisodeLinks(urlCandidate, includeMega = false, excludeServers
     throw new ApiError(400, "URL invalida - no se pudo extraer slug y numero");
   }
 
+  const includeMega =
+    includeMegaRaw === undefined ||
+    includeMegaRaw === null ||
+    String(includeMegaRaw).toLowerCase() === "true" ||
+    includeMegaRaw === true;
+
   const html = await fetchHtml(urlCandidate);
   const $ = cheerio.load(html);
 
   const streamLinks = { SUB: [], DUB: [] };
-  const excludeList = (excludeServers || []).map((s) => s.toLowerCase());
-  
+  const downloadLinks = { SUB: [], DUB: [] };
+  const excludeList = (Array.isArray(excludeServers) ? excludeServers : []).map((s) => s.toLowerCase());
+
+  const isAnimeDub =
+    /latino|dub/i.test(slug) ||
+    /latino|dub/i.test(urlCandidate);
+
   $(".play-video").each((_, el) => {
-    const serverName = $(el).text().trim().toLowerCase();
+    const rawServerName = $(el).text().trim() || "Server";
+    const serverName = rawServerName.toLowerCase();
     const dataPlayer = $(el).attr("data-player");
     if (!dataPlayer) return;
 
@@ -246,12 +259,38 @@ async function getEpisodeLinks(urlCandidate, includeMega = false, excludeServers
     }
 
     try {
-      const url = Buffer.from(dataPlayer, 'base64').toString('utf8');
+      const url = Buffer.from(dataPlayer, "base64").toString("utf8");
       if (url.startsWith("http")) {
-        streamLinks.SUB.push({ server: serverName, url });
+        const isServerDub = /lat|dub|castellano|español|esp\b/i.test(rawServerName) || isAnimeDub;
+        const variant = isServerDub ? "DUB" : "SUB";
+        streamLinks[variant].push({ server: rawServerName, url });
       }
-    } catch(err) {}
+    } catch (err) {}
   });
+
+  $("a.btn-download, .download-links a, a[href*='mega.nz']").each((_, el) => {
+    const href = $(el).attr("href");
+    if (!href || !href.startsWith("http")) return;
+    const sName = $(el).text().trim() || "Download";
+    const isServerDub = /lat|dub|castellano|español|esp\b/i.test(sName) || isAnimeDub;
+    const variant = isServerDub ? "DUB" : "SUB";
+    if (!includeMega && /mega/i.test(sName + " " + href)) return;
+    downloadLinks[variant].push({ server: sName, url: href });
+  });
+
+  const allSub = [...streamLinks.SUB];
+  for (const dl of downloadLinks.SUB) {
+    if (!allSub.some((s) => s.url === dl.url)) {
+      allSub.push(dl);
+    }
+  }
+
+  const allDub = [...streamLinks.DUB];
+  for (const dl of downloadLinks.DUB) {
+    if (!allDub.some((s) => s.url === dl.url)) {
+      allDub.push(dl);
+    }
+  }
 
   const episodeTitle = $("h1").first().text().trim() || `Episodio ${episodeNumber}`;
 
@@ -263,22 +302,16 @@ async function getEpisodeLinks(urlCandidate, includeMega = false, excludeServers
       title: episodeTitle,
       season: null,
       variants: {
-        SUB: streamLinks.SUB.length > 0 ? 1 : 0,
-        DUB: 0,
+        SUB: allSub.length > 0 ? 1 : 0,
+        DUB: allDub.length > 0 ? 1 : 0,
       },
       publishedAt: null,
       servers: {
-        sub: streamLinks.SUB,
-        dub: [],
+        sub: allSub,
+        dub: allDub,
       },
-      streamLinks: {
-        SUB: streamLinks.SUB,
-        DUB: [],
-      },
-      downloadLinks: {
-        SUB: [],
-        DUB: [],
-      },
+      streamLinks,
+      downloadLinks,
     },
     source: "monoschinos",
   };

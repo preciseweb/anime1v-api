@@ -28,6 +28,25 @@ async function fetchHtml(url) {
   }
 }
 
+async function fetchHtmlWithCookies(url) {
+  try {
+    const timeout = Number(process.env.REQUEST_TIMEOUT_MS || 15000);
+    const response = await axios.get(url, {
+      timeout,
+      headers: HTTP_HEADERS,
+      maxRedirects: 5,
+      validateStatus: (status) => status >= 200 && status < 400,
+    });
+    const setCookie = response.headers["set-cookie"];
+    const cookies = setCookie
+      ? (Array.isArray(setCookie) ? setCookie : [setCookie]).map((c) => c.split(";")[0]).join("; ")
+      : "";
+    return { html: response.data, cookies };
+  } catch (error) {
+    throw new ApiError(500, "No se pudo obtener contenido desde JKAnime", error.message);
+  }
+}
+
 async function fetchJson(url, options = {}) {
   try {
     const timeout = Number(process.env.REQUEST_TIMEOUT_MS || 15000);
@@ -438,6 +457,13 @@ function parseEpisodesFromHtml(html, domain, slug) {
       return;
     }
 
+    if (slug) {
+      const pathSegments = new URL(url).pathname.split("/").filter(Boolean);
+      if (pathSegments[0] !== slug) {
+        return;
+      }
+    }
+
     const number = parseEpisodeNumberFromUrl(url);
     episodes.push({
       id: null,
@@ -494,43 +520,84 @@ function parseToken(html) {
   return match ? match[1] : null;
 }
 
-async function fetchEpisodesFromApi(animeId, slug, referer, token) {
+async function fetchEpisodesFromApi(animeId, slug, referer, token, cookies) {
   if (!animeId) {
     return [];
   }
 
   const apiUrl = `https://${DEFAULT_DOMAIN}/ajax/episodes/${animeId}/1`;
   const headers = {
+    ...HTTP_HEADERS,
     "X-Requested-With": "XMLHttpRequest",
     Referer: referer,
+    "Content-Type": "application/x-www-form-urlencoded",
+    ...(cookies ? { Cookie: cookies } : {}),
   };
 
-  let data = await fetchJson(apiUrl, { headers, method: "GET" });
-
-  if (!data && token) {
-    data = await fetchJson(apiUrl, {
+  try {
+    const postBody = new URLSearchParams({ _token: token || "" }).toString();
+    const response = await axios.post(apiUrl, postBody, {
+      timeout: Number(process.env.REQUEST_TIMEOUT_MS || 15000),
       headers,
-      method: "POST",
-      data: { _token: token },
     });
+
+    const data = response.data;
+    const total = Number(data?.total);
+    if (Number.isFinite(total) && total > 0) {
+      const generatedEpisodes = [];
+      for (let i = 1; i <= total; i++) {
+        generatedEpisodes.push({
+          id: null,
+          number: i,
+          title: `Episodio ${i}`,
+          url: `https://${DEFAULT_DOMAIN}/${slug}/${i}/`,
+        });
+      }
+      return generatedEpisodes;
+    }
+
+    const items = Array.isArray(data?.data) ? data.data : [];
+    if (items.length > 0) {
+      return items
+        .map((item) => {
+          const number = parseNumber(item.number || item.episode || item.episodio);
+          if (!number && number !== 0) {
+            return null;
+          }
+
+          return {
+            id: item.id ?? null,
+            number,
+            title: item.title || `Episodio ${number}`,
+            url: `https://${DEFAULT_DOMAIN}/${slug}/${number}/`,
+          };
+        })
+        .filter(Boolean);
+    }
+  } catch (err) {
+    try {
+      const getRes = await axios.get(apiUrl, {
+        timeout: Number(process.env.REQUEST_TIMEOUT_MS || 15000),
+        headers,
+      });
+      const data = getRes.data;
+      const total = Number(data?.total);
+      if (Number.isFinite(total) && total > 0) {
+        const generatedEpisodes = [];
+        for (let i = 1; i <= total; i++) {
+          generatedEpisodes.push({
+            id: null,
+            number: i,
+            title: `Episodio ${i}`,
+            url: `https://${DEFAULT_DOMAIN}/${slug}/${i}/`,
+          });
+        }
+        return generatedEpisodes;
+      }
+    } catch (_) {}
   }
 
-  const items = Array.isArray(data?.data) ? data.data : [];
-  return items
-    .map((item) => {
-      const number = parseNumber(item.number || item.episode);
-      if (!number) {
-        return null;
-      }
-
-      return {
-        id: item.id ?? null,
-        number,
-        title: item.title || `Episodio ${number}`,
-        url: `https://${DEFAULT_DOMAIN}/${slug}/${number}/`,
-      };
-    })
-    .filter(Boolean);
+  return [];
 }
 
 function buildLinkRecord(serverName, url, quality) {
@@ -596,18 +663,20 @@ async function getAnimeInfo(urlCandidate) {
   }
 
   const baseUrl = `https://${DEFAULT_DOMAIN}/${slug}/`;
-  const html = await fetchHtml(baseUrl);
+  const { html, cookies } = await fetchHtmlWithCookies(baseUrl);
   const info = parseAnimeInfoFromHtml(html, DEFAULT_DOMAIN);
 
   let episodes = parseEpisodesFromHtml(html, DEFAULT_DOMAIN, slug);
 
   if (episodes.length === 0) {
     const token = parseToken(html);
-    const apiEpisodes = await fetchEpisodesFromApi(info.animeId, slug, baseUrl, token);
+    const apiEpisodes = await fetchEpisodesFromApi(info.animeId, slug, baseUrl, token, cookies);
     if (apiEpisodes.length > 0) {
       episodes = apiEpisodes;
     }
   }
+
+  episodes.sort((a, b) => (a.number || 0) - (b.number || 0));
 
   const totalEpisodes = info.infoValues.totalEpisodes || episodes.length || null;
 
@@ -639,7 +708,11 @@ async function getAnimeInfo(urlCandidate) {
 
 async function getEpisodeLinks(urlCandidate, includeMegaRaw, excludeServersRaw) {
   const normalizedUrl = normalizeInputUrl(urlCandidate);
-  const includeMega = String(includeMegaRaw).toLowerCase() === "true";
+  const includeMega =
+    includeMegaRaw === undefined ||
+    includeMegaRaw === null ||
+    String(includeMegaRaw).toLowerCase() === "true" ||
+    includeMegaRaw === true;
   const excludedTokens = buildExcludedTokens(includeMega, excludeServersRaw);
 
   const html = await fetchHtml(normalizedUrl);
@@ -691,6 +764,20 @@ async function getEpisodeLinks(urlCandidate, includeMegaRaw, excludeServersRaw) 
   const filteredDownloadSub = filterLinksByServers(downloadLinks.SUB, excludedTokens);
   const filteredDownloadDub = filterLinksByServers(downloadLinks.DUB, excludedTokens);
 
+  const allSub = [...filteredStreamSub];
+  for (const dl of filteredDownloadSub) {
+    if (!allSub.some((s) => s.url === dl.url)) {
+      allSub.push(dl);
+    }
+  }
+
+  const allDub = [...filteredStreamDub];
+  for (const dl of filteredDownloadDub) {
+    if (!allDub.some((s) => s.url === dl.url)) {
+      allDub.push(dl);
+    }
+  }
+
   return {
     success: true,
     data: {
@@ -699,13 +786,13 @@ async function getEpisodeLinks(urlCandidate, includeMegaRaw, excludeServersRaw) 
       title: title || `Episodio ${parseEpisodeNumberFromUrl(normalizedUrl) || "?"}`,
       season: null,
       variants: {
-        SUB: filteredStreamSub.length > 0 || filteredDownloadSub.length > 0 ? 1 : 0,
-        DUB: filteredStreamDub.length > 0 || filteredDownloadDub.length > 0 ? 1 : 0,
+        SUB: allSub.length > 0 ? 1 : 0,
+        DUB: allDub.length > 0 ? 1 : 0,
       },
       publishedAt: null,
       servers: {
-        sub: sanitizeLinksForResponse(filteredStreamSub),
-        dub: sanitizeLinksForResponse(filteredStreamDub),
+        sub: sanitizeLinksForResponse(allSub),
+        dub: sanitizeLinksForResponse(allDub),
       },
       streamLinks: {
         SUB: sanitizeLinksForResponse(filteredStreamSub),

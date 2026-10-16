@@ -50,6 +50,8 @@ document.addEventListener('DOMContentLoaded', () => {
   let hlsInstance = null;
   let currentAnimeData = null;
   let currentEpisodeLinks = null;
+  let currentServersData = { sub: [], dub: [] };
+  let currentActiveVariant = 'sub';
   let currentEpisodeNumber = null;
   let catalogPage = 1;
   let catalogGenre = '';
@@ -430,22 +432,92 @@ document.addEventListener('DOMContentLoaded', () => {
     serversList.innerHTML = '<div style="color:var(--text-muted);">Consultando servidores de video...</div>';
 
     try {
-      const res = await fetch(`/api/v1/anime/episode?url=${encodeURIComponent(episodeUrl)}`, {
+      const res = await fetch(`/api/v1/anime/episode?url=${encodeURIComponent(episodeUrl)}&includeMega=true`, {
         headers: getHeaders()
       });
       const responseData = await res.json();
 
-      if (responseData.success && responseData.data?.servers?.sub) {
-        currentEpisodeLinks = responseData.data.servers.sub;
-        resolveMultiServer(currentEpisodeLinks);
+      if (responseData.success && responseData.data?.servers) {
+        const subServers = Array.isArray(responseData.data.servers.sub) ? responseData.data.servers.sub : [];
+        const dubServers = Array.isArray(responseData.data.servers.dub) ? responseData.data.servers.dub : [];
+
+        currentServersData = { sub: subServers, dub: dubServers };
+
+        const countSubEl = document.getElementById('count-sub');
+        const countDubEl = document.getElementById('count-dub');
+        if (countSubEl) countSubEl.textContent = subServers.length;
+        if (countDubEl) countDubEl.textContent = dubServers.length;
+
+        // Selección automática de variante (Subtitulado vs Doblaje)
+        if (currentActiveVariant === 'dub' && dubServers.length > 0) {
+          currentActiveVariant = 'dub';
+        } else if (subServers.length === 0 && dubServers.length > 0) {
+          currentActiveVariant = 'dub';
+        } else {
+          currentActiveVariant = 'sub';
+        }
+
+        updateVariantTabsUI();
+
+        const activeList = currentServersData[currentActiveVariant] || [];
+        currentEpisodeLinks = activeList;
+
+        if (activeList.length > 0) {
+          resolveMultiServer(activeList);
+        } else {
+          playingSubtitle.textContent = "Sin servidores";
+          videoLoader.innerHTML = '<i class="fa-solid fa-face-frown" style="font-size:36px; color:var(--accent-indigo);"></i> <p>No se encontraron servidores para este episodio.</p>';
+          serversList.innerHTML = '<div style="color:var(--text-muted); padding:10px;">No hay servidores disponibles.</div>';
+        }
       } else {
         playingSubtitle.textContent = "Error al obtener servidores";
-        videoLoader.innerHTML = '<i class="fa-solid fa-face-frown" style="font-size:36px; color:var(--accent-purple);"></i> <p>No se encontraron servidores de streaming para este episodio.</p>';
+        videoLoader.innerHTML = '<i class="fa-solid fa-face-frown" style="font-size:36px; color:var(--accent-indigo);"></i> <p>No se encontraron servidores de streaming para este episodio.</p>';
       }
     } catch (err) {
       console.error('Error al obtener servidores:', err);
       playingSubtitle.textContent = "Error de red";
       videoLoader.innerHTML = '<i class="fa-solid fa-triangle-exclamation" style="font-size:36px; color:#ff3838;"></i> <p>Falla al contactar con la API.</p>';
+    }
+  }
+
+  function setupVariantTabs() {
+    const tabSub = document.getElementById('tab-sub');
+    const tabDub = document.getElementById('tab-dub');
+
+    if (tabSub) {
+      tabSub.onclick = () => {
+        if (currentActiveVariant === 'sub') return;
+        currentActiveVariant = 'sub';
+        updateVariantTabsUI();
+        switchVariant('sub');
+      };
+    }
+
+    if (tabDub) {
+      tabDub.onclick = () => {
+        if (currentActiveVariant === 'dub') return;
+        currentActiveVariant = 'dub';
+        updateVariantTabsUI();
+        switchVariant('dub');
+      };
+    }
+  }
+
+  function updateVariantTabsUI() {
+    const tabSub = document.getElementById('tab-sub');
+    const tabDub = document.getElementById('tab-dub');
+    if (tabSub) tabSub.classList.toggle('active', currentActiveVariant === 'sub');
+    if (tabDub) tabDub.classList.toggle('active', currentActiveVariant === 'dub');
+  }
+
+  function switchVariant(variant) {
+    const list = currentServersData[variant] || [];
+    currentEpisodeLinks = list;
+    if (list.length > 0) {
+      resolveMultiServer(list);
+    } else {
+      serversList.innerHTML = `<div style="color:var(--text-muted); padding:10px;">No hay servidores de audio ${variant === 'dub' ? 'doblado (latino/español)' : 'subtitulado'} disponibles para este episodio.</div>`;
+      videoLoader.innerHTML = `<i class="fa-solid fa-face-frown" style="font-size:36px; color:var(--accent-indigo);"></i> <p>No hay servidores disponibles para ${variant === 'dub' ? 'doblaje' : 'subtitulado'}.</p>`;
     }
   }
 
@@ -455,8 +527,34 @@ document.addEventListener('DOMContentLoaded', () => {
   async function resolveMultiServer(servers) {
     // Identificar servidores soportados (que tienen resolutor nativo)
     const supportedServers = servers.filter(s => {
-      const n = (s.server || '').toLowerCase() + ' ' + (s.url || '').toLowerCase();
-      return n.includes('voe') || n.includes('wish') || n.includes('tape') || n.includes('playnix') || n.includes('medix') || n.includes('awish');
+      const n = ((s.server || '') + ' ' + (s.url || '')).toLowerCase();
+      return (
+        n.includes('voe') ||
+        n.includes('wish') ||
+        n.includes('tape') ||
+        n.includes('playnix') ||
+        n.includes('medix') ||
+        n.includes('awish') ||
+        n.includes('vidhide') ||
+        n.includes('mixdrop') ||
+        n.includes('dood') ||
+        n.includes('dropload') ||
+        n.includes('yourupload') ||
+        n.includes('mp4upload') ||
+        n.includes('filemoon') ||
+        n.includes('okru') ||
+        n.includes('ok.ru') ||
+        n.includes('hqq') ||
+        n.includes('netu') ||
+        n.includes('waaw') ||
+        n.includes('pixeldrain') ||
+        n.includes('pdrain') ||
+        n.includes('1fichier') ||
+        n.includes('upnshare') ||
+        n.includes('upstream') ||
+        n.includes('.mp4') ||
+        n.includes('.m3u8')
+      );
     });
 
     // Renderizar TODOS los botones de servidor (soportados + no soportados)
@@ -803,6 +901,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // --- CARGA INICIAL ---
+  setupVariantTabs();
   loadCatalog(true);
   setupInfiniteScroll();
 });

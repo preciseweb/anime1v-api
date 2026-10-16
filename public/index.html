@@ -141,7 +141,17 @@
             </div>
             
             <div class="server-selection-panel">
-              <h4><i class="fa-solid fa-satellite-dish"></i> Servidores Disponibles</h4>
+              <div class="server-panel-header">
+                <h4><i class="fa-solid fa-satellite-dish"></i> Servidores Disponibles</h4>
+                <div class="variant-tabs" id="variant-tabs">
+                  <button type="button" class="variant-tab active" id="tab-sub" data-variant="sub">
+                    <i class="fa-solid fa-closed-captioning"></i> Subtitulado <span class="badge" id="count-sub">0</span>
+                  </button>
+                  <button type="button" class="variant-tab" id="tab-dub" data-variant="dub">
+                    <i class="fa-solid fa-microphone"></i> Doblaje (Audio) <span class="badge" id="count-dub">0</span>
+                  </button>
+                </div>
+              </div>
               <div class="servers-list" id="servers-list"></div>
             </div>
           </div>

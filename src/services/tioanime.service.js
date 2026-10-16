@@ -56,7 +56,12 @@ function parseEpisodeNumberFromUrl(url) {
 
 function slugFromUrl(url) {
   try {
-    const segments = new URL(url).pathname.split("/").filter(Boolean);
+    const parsed = new URL(url);
+    const segments = parsed.pathname.split("/").filter(Boolean);
+    if (segments.length === 0) return null;
+    if (segments[0] === "anime") {
+      return segments[1] || segments[0];
+    }
     const lastSegment = segments[segments.length - 1] || "";
     return lastSegment.replace(/-\d+$/, "");
   } catch (_) {
@@ -160,7 +165,7 @@ async function searchAnime(query, domainCandidate) {
   }
 
   const domain = (domainCandidate || DEFAULT_DOMAIN).toString().trim();
-  const searchUrl = `https://${domain}/directorio?search=${encodeURIComponent(cleanQuery)}`;
+  const searchUrl = `https://${domain}/directorio?q=${encodeURIComponent(cleanQuery)}`;
   const html = await fetchHtml(searchUrl);
 
   const $ = cheerio.load(html);
@@ -218,6 +223,7 @@ async function getAnimeInfo(urlCandidate) {
     $("a[href*='/ver/']").each((_, el) => {
       const href = $(el).attr("href");
       if (!href) return;
+      if (slug && !href.includes(`/ver/${slug}-`)) return; // Strictly only for this anime!
       const number = parseEpisodeNumberFromUrl(`https://${DEFAULT_DOMAIN}${href}`);
       if (number) {
         episodesList.push({ id: null, number });
@@ -284,20 +290,53 @@ async function getEpisodeLinks(urlCandidate) {
   const streamLinks = { SUB: [], DUB: [] };
   const downloadLinks = { SUB: [], DUB: [] };
 
+  const isAnimeDub =
+    slug.includes("latino") ||
+    slug.includes("dub") ||
+    urlCandidate.includes("latino") ||
+    urlCandidate.includes("dub");
+
   if (videoSources) {
     for (const [variantKey, entries] of Object.entries(videoSources)) {
       for (const entry of entries) {
         const link = buildLinkRecord(entry.server, entry.url, null);
         if (link) {
-          const key = normalizeVariantKey(variantKey);
+          const sName = (entry.server || "").toLowerCase();
+          const isDub = isAnimeDub || sName.includes("lat") || sName.includes("dub") || sName.includes("esp") || variantKey.toLowerCase().includes("dub");
+          const key = isDub ? "DUB" : "SUB";
           streamLinks[key].push(link);
         }
       }
     }
   }
 
+  const $ = cheerio.load(html);
+  $("table tr").each((_, tr) => {
+    const cells = $(tr).find("td");
+    if (cells.length < 3) return;
+    const serverName = $(cells[0]).text().trim() || "Download";
+    const lang = $(cells[1]).text().trim().toLowerCase();
+    const href = $(tr).find("a").attr("href");
+    if (href && href.startsWith("http")) {
+      const isDub = isAnimeDub || lang.includes("lat") || lang.includes("dub") || lang.includes("esp");
+      const variant = isDub ? "DUB" : "SUB";
+      const link = buildLinkRecord(serverName, href, null);
+      if (link) downloadLinks[variant].push(link);
+    }
+  });
+
+  const allSubServers = [...streamLinks.SUB];
+  for (const dl of downloadLinks.SUB) {
+    if (!allSubServers.some((s) => s.url === dl.url)) allSubServers.push(dl);
+  }
+
+  const allDubServers = [...streamLinks.DUB];
+  for (const dl of downloadLinks.DUB) {
+    if (!allDubServers.some((s) => s.url === dl.url)) allDubServers.push(dl);
+  }
+
   const episodeTitle =
-    cheerio.load(html)("h1.title, h1").first().text().trim() || `Episodio ${episodeNumber}`;
+    $("h1.title, h1").first().text().trim() || `Episodio ${episodeNumber}`;
 
   return {
     success: true,
@@ -307,21 +346,21 @@ async function getEpisodeLinks(urlCandidate) {
       title: episodeTitle,
       season: null,
       variants: {
-        SUB: streamLinks.SUB.length > 0 || downloadLinks.SUB.length > 0 ? 1 : 0,
-        DUB: streamLinks.DUB.length > 0 || downloadLinks.DUB.length > 0 ? 1 : 0,
+        SUB: allSubServers.length > 0 ? 1 : 0,
+        DUB: allDubServers.length > 0 ? 1 : 0,
       },
       publishedAt: null,
       servers: {
-        sub: streamLinks.SUB.map((l) => ({ server: l.server, url: l.url })),
-        dub: streamLinks.DUB.map((l) => ({ server: l.server, url: l.url })),
+        sub: allSubServers.map((l) => ({ server: l.server, url: l.url })),
+        dub: allDubServers.map((l) => ({ server: l.server, url: l.url })),
       },
       streamLinks: {
         SUB: streamLinks.SUB.map((l) => ({ server: l.server, url: l.url })),
         DUB: streamLinks.DUB.map((l) => ({ server: l.server, url: l.url })),
       },
       downloadLinks: {
-        SUB: [],
-        DUB: [],
+        SUB: downloadLinks.SUB.map((l) => ({ server: l.server, url: l.url })),
+        DUB: downloadLinks.DUB.map((l) => ({ server: l.server, url: l.url })),
       },
     },
     source: "tioanime",

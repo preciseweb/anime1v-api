@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: anime1v-api
+    env: docker
+    plan: free
+    region: oregon
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: REQUEST_TIMEOUT_MS
+        value: 15000
+      - key: MAX_CONCURRENT_PAGES
+        value: 1

@@ -4,6 +4,7 @@ const { dailyRateLimit } = require("../middlewares/rate-limit");
 const animeService = require("../services/anime.service");
 const downloadService = require("../services/download.service");
 const { resolveEmbedUrl } = require("../utils/resolvers");
+const { isLikelyVideoUrl } = require("../utils/http");
 const { ApiError } = require("../utils/api-error");
 
 const router = express.Router();
@@ -74,7 +75,11 @@ router.get(
       throw new ApiError(400, "Se requiere el parametro url");
     }
 
-    const response = await animeService.getEpisodeLinks(req.query.url, req.query.includeMega, req.query.excludeServers);
+    const includeMega = req.query.includeMega !== undefined
+      ? String(req.query.includeMega).toLowerCase() === "true"
+      : true;
+
+    const response = await animeService.getEpisodeLinks(req.query.url, includeMega, req.query.excludeServers);
     res.status(200).json(response);
   })
 );
@@ -138,13 +143,26 @@ router.get(
     const resolvePromises = urls.map(async (url) => {
       try {
         const directUrl = await resolveEmbedUrl(url);
-        if (directUrl && directUrl !== url) {
+        const isVideo = directUrl && (isLikelyVideoUrl(directUrl) || /\.(?:m3u8|mp4)(?:\?|#|$)/i.test(directUrl));
+        if (directUrl && (directUrl !== url || isVideo)) {
           let server = "unknown";
-          if (url.includes("voe")) server = "voe";
-          else if (url.includes("tape")) server = "streamtape";
-          else if (url.includes("wish") || url.includes("playnix") || url.includes("medix") || url.includes("awish")) server = "streamwish";
-          else if (url.includes("vidhide")) server = "vidhide";
-          else if (url.includes("dood")) server = "doodstream";
+          const lower = (url + " " + directUrl).toLowerCase();
+          if (lower.includes("voe")) server = "voe";
+          else if (lower.includes("tape")) server = "streamtape";
+          else if (lower.includes("wish") || lower.includes("playnix") || lower.includes("medix") || lower.includes("awish") || lower.includes("sfastwish")) server = "streamwish";
+          else if (lower.includes("vidhide")) server = "vidhide";
+          else if (lower.includes("dood")) server = "doodstream";
+          else if (lower.includes("mixdrop") || lower.includes("mxdcontent")) server = "mixdrop";
+          else if (lower.includes("yourupload")) server = "yourupload";
+          else if (lower.includes("dropload") || lower.includes("dr0p")) server = "dropload";
+          else if (lower.includes("mp4upload")) server = "mp4upload";
+          else if (lower.includes("filemoon")) server = "filemoon";
+          else if (lower.includes("hqq") || lower.includes("waaw") || lower.includes("netu")) server = "hqq";
+          else if (lower.includes("ok.ru") || lower.includes("okru")) server = "okru";
+          else if (lower.includes("pdrain") || lower.includes("pixeldrain")) server = "pixeldrain";
+          else if (lower.includes("1fichier")) server = "1fichier";
+          else if (lower.includes("zilla") || lower.includes("hls")) server = "hls";
+          else if (lower.includes("mega")) server = "mega";
 
           return {
             success: true,

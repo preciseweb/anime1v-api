@@ -984,12 +984,15 @@ function chooseCandidateLinks(episodeData, variant, preferredServer) {
 
   const downloadLinks = episodeData.downloadLinks || { SUB: [], DUB: [] };
   const streamLinks = episodeData.streamLinks || { SUB: [], DUB: [] };
+  const servers = episodeData.servers || { sub: [], dub: [] };
 
   const candidates = [
     ...(downloadLinks[normalizedVariant] || []),
-    ...(downloadLinks[otherVariant] || []),
     ...(streamLinks[normalizedVariant] || []),
+    ...(normalizedVariant === "DUB" ? (servers.dub || []) : (servers.sub || [])),
+    ...(downloadLinks[otherVariant] || []),
     ...(streamLinks[otherVariant] || []),
+    ...(otherVariant === "DUB" ? (servers.dub || []) : (servers.sub || [])),
   ];
 
   const seen = new Set();
