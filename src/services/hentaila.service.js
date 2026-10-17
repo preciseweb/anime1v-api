@@ -1,6 +1,7 @@
 const axios = require("axios");
 const { URL } = require("node:url");
 const { ApiError } = require("../utils/api-error");
+const { normalizeVariant, filterServerLinks, addServerLink } = require("../utils/episode-links");
 
 const DEFAULT_DOMAIN = "hentaila.com";
 
@@ -11,61 +12,31 @@ const HTTP_HEADERS = {
   "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
 };
 
-function resolveDataValue(schemaObj, values, key) {
-  const schema = schemaObj[key];
-  if (schema === undefined || schema === null) {
-    return null;
-  }
+// SvelteKit stores nested objects and arrays as references into one value table.
+function decodeNodeData(values) {
+  const decoded = new Map();
+  function resolve(index) {
+    if (!Number.isInteger(index) || index < 0 || index >= values.length) return null;
+    if (decoded.has(index)) return decoded.get(index);
+    const value = values[index];
+    if (value === null || typeof value !== "object") return value;
+    if (Array.isArray(value) && value[0] === "Date") return value[1];
 
-  if (Array.isArray(schema)) {
-    return schema.map((idx) => resolveDataValue(idx, values, 0));
-  }
-
-  if (typeof schema === "number") {
-    return resolveDataValue(values, values, schema);
-  }
-
-  if (typeof schema === "object" && schema !== null) {
-    const result = {};
-    for (const [k, v] of Object.entries(schema)) {
-      result[k] = resolveDataValue(v, values, v);
+    const result = Array.isArray(value) ? [] : {};
+    decoded.set(index, result);
+    for (const [key, reference] of Object.entries(value)) {
+      Object.defineProperty(result, key, {
+        value: resolve(reference), enumerable: true, writable: true, configurable: true,
+      });
     }
     return result;
   }
-
-  return schema;
-}
-
-function devalueObject(schema, values) {
-  if (typeof schema !== "object" || schema === null) {
-    return schema;
-  }
-
-  const result = {};
-  for (const [key, valueIdx] of Object.entries(schema)) {
-    if (typeof valueIdx === "number") {
-      result[key] = values[valueIdx];
-    } else if (typeof valueIdx === "object" && valueIdx !== null && !Array.isArray(valueIdx)) {
-      result[key] = devalueObject(valueIdx, values);
-    } else if (Array.isArray(valueIdx)) {
-      result[key] = valueIdx.map((idx) => {
-        if (typeof idx === "number") return values[idx];
-        if (typeof idx === "object" && idx !== null && !Array.isArray(idx)) {
-          return devalueObject(idx, values);
-        }
-        return idx;
-      });
-    } else {
-      result[key] = valueIdx;
-    }
-  }
-
-  return result;
+  return resolve(0);
 }
 
 function parseSvelteKitNodes(nodes) {
   if (!Array.isArray(nodes)) {
-    return null;
+    return [];
   }
 
   const results = [];
@@ -79,7 +50,7 @@ function parseSvelteKitNodes(nodes) {
     const values = node.data;
 
     if (typeof schema === "object" && schema !== null) {
-      results.push({ schema, values });
+      results.push({ schema, values, decoded: decodeNodeData(values) });
     } else {
       results.push(null);
     }
@@ -127,22 +98,6 @@ function resolveResultsArray(dataValues, refsArray) {
     .filter(Boolean);
 }
 
-function resolveNodeObject(nodeData, keys) {
-  if (!nodeData || !nodeData.schema || !Array.isArray(nodeData.values)) {
-    return null;
-  }
-
-  const result = {};
-  for (const key of Array.isArray(keys) ? keys : [keys]) {
-    const idx = nodeData.schema[key];
-    if (typeof idx === "number" && idx >= 0 && idx < nodeData.values.length) {
-      result[key] = nodeData.values[idx];
-    }
-  }
-
-  return result;
-}
-
 async function fetchJson(url) {
   try {
     const timeout = Number(process.env.REQUEST_TIMEOUT_MS || 15000);
@@ -158,225 +113,156 @@ async function fetchJson(url) {
   }
 }
 
-function normalizeToken(value) {
-  return (value || "")
-    .toString()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "")
-    .trim();
+function parseEpisodeNumber(value) {
+  return /^\d+(?:\.\d+)?$/.test(String(value)) ? Number(value) : null;
 }
 
-function normalizeVariantKey(value) {
-  const normalized = normalizeToken(value);
-  if (!normalized) {
-    return "SUB";
-  }
-
-  if (normalized.includes("sub") || normalized.includes("jap") || normalized.includes("jp")) {
-    return "SUB";
-  }
-
-  if (normalized.includes("dub") || normalized.includes("lat") || normalized.includes("latin") || normalized.includes("esp")) {
-    return "DUB";
-  }
-
-  return "SUB";
-}
-
-function parseEpisodeNumberFromUrl(url) {
+function parseAnimeUrl(url, baseUrl) {
   try {
-    const pathname = new URL(url).pathname;
-    const segments = pathname.split("/").filter(Boolean);
-    const lastSegment = segments[segments.length - 1] || "";
-    const numberMatch = lastSegment.match(/(\d+)$/);
-    return numberMatch ? Number(numberMatch[1]) : null;
-  } catch (_error) {
-    return null;
+    const parsed = new URL(url, baseUrl);
+    if (!/^https?:$/.test(parsed.protocol)) return null;
+    const segments = parsed.pathname.split("/").filter(Boolean);
+    if (segments[segments.length - 1] === "__data.json") segments.pop();
+    if (segments[0] === "media" && (segments.length === 2 || segments.length === 3)) {
+      const episode = segments.length === 3 ? parseEpisodeNumber(segments[2]) : null;
+      if (segments.length === 3 && episode === null) return null;
+      return { slug: segments[1], episode };
+    }
+    if (segments[0] === "ver" && segments.length === 2) {
+      const match = segments[1].match(/^(.*)-(\d+(?:\.\d+)?)$/);
+      if (match && match[1]) return { slug: match[1], episode: Number(match[2]) };
+    }
+  } catch (_) {
+    // Unsupported or malformed URLs have no reliable anime identity.
   }
+  return null;
 }
 
-function buildLinkRecord(serverName, url, quality) {
-  if (!url) {
-    return null;
+function parseMediaFromNode(nodeData, slug) {
+  const visited = new Set();
+  function find(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || visited.has(value)) return null;
+    visited.add(value);
+    // Follow page data and the named media object, never recommendations or layout objects.
+    const nested = find(value.media) || find(value.data);
+    if (nested) return nested;
+    return value.slug === slug && (value.title || Array.isArray(value.episodes)) ? value : null;
   }
-
-  return {
-    server: serverName || "Unknown",
-    url,
-    quality: quality || null,
-  };
-}
-
-function parseEmbedsFromNode(nodeData) {
-  if (!nodeData || !nodeData.schema) {
-    return { SUB: [], DUB: [] };
-  }
-
-  const schema = nodeData.schema;
-  const data = nodeData.values;
-
-  const embedsIdx = schema["embeds"];
-  if (typeof embedsIdx !== "number") {
-    return { SUB: [], DUB: [] };
-  }
-
-  const embedsRaw = data[embedsIdx];
-  if (!embedsRaw || typeof embedsRaw !== "object") {
-    return { SUB: [], DUB: [] };
-  }
-
-  const result = { SUB: [], DUB: [] };
-  for (const [variantKey, variantIdx] of Object.entries(embedsRaw)) {
-    const variant = normalizeVariantKey(variantKey);
-
-    // variantIdx points to an array of schema references
-    const refsArray = typeof variantIdx === "number" ? data[variantIdx] : variantIdx;
-    if (!Array.isArray(refsArray)) {
-      continue;
-    }
-
-    const entries = resolveResultsArray(data, refsArray);
-    for (const entry of entries) {
-      if (!entry || !entry.url) {
-        continue;
-      }
-
-      const link = buildLinkRecord(entry.server || "Unknown", entry.url, null);
-      if (link) {
-        result[variant].push(link);
-      }
-    }
-  }
-
-  return result;
-}
-
-function parseDownloadsFromNode(nodeData) {
-  if (!nodeData || !nodeData.schema) {
-    return { SUB: [], DUB: [] };
-  }
-
-  const schema = nodeData.schema;
-  const data = nodeData.values;
-
-  const downloadsIdx = schema["downloads"];
-  if (typeof downloadsIdx !== "number") {
-    return { SUB: [], DUB: [] };
-  }
-
-  const downloadsRaw = data[downloadsIdx];
-  if (!downloadsRaw || typeof downloadsRaw !== "object") {
-    return { SUB: [], DUB: [] };
-  }
-
-  const result = { SUB: [], DUB: [] };
-  for (const [variantKey, variantIdx] of Object.entries(downloadsRaw)) {
-    const variant = normalizeVariantKey(variantKey);
-
-    const refsArray = typeof variantIdx === "number" ? data[variantIdx] : variantIdx;
-    if (!Array.isArray(refsArray)) {
-      continue;
-    }
-
-    const entries = resolveResultsArray(data, refsArray);
-    for (const entry of entries) {
-      if (!entry || !entry.url) {
-        continue;
-      }
-
-      const link = buildLinkRecord(entry.server || "Download", entry.url, entry.quality || entry.server || null);
-      if (link) {
-        result[variant].push(link);
-      }
-    }
-  }
-
-  return result;
-}
-
-function parseMediaFromNode(nodeData) {
-  if (!nodeData || !nodeData.schema) {
-    return null;
-  }
-
-  const data = nodeData.values;
-
-  // Check for nested schema pattern (e.g. {"media": 1} → resolve to inner schema)
-  const outerKeys = Object.keys(nodeData.schema);
-  let innerSchemaIndex = -1;
-  for (const key of outerKeys) {
-    const idx = nodeData.schema[key];
-    if (typeof idx === "number" && typeof data[idx] === "object" && data[idx] !== null && !Array.isArray(data[idx])) {
-      innerSchemaIndex = idx;
-      break;
-    }
-  }
-
-  // Use inner schema if found, otherwise use outer schema
-  const schemaIdx = innerSchemaIndex >= 0 ? innerSchemaIndex : 0;
-  const schema = innerSchemaIndex >= 0 ? data[innerSchemaIndex] : nodeData.schema;
-
-  const get = (key) => {
-    const idx = schema[key];
-    return (typeof idx === "number" && idx < data.length) ? data[idx] : null;
-  };
-
-  const genresRefs = get("genres");
-  const genres = Array.isArray(genresRefs)
-    ? resolveResultsArray(data, genresRefs)
-    : [];
-
-  const episodesRefs = get("episodes");
-  const episodes = Array.isArray(episodesRefs)
-    ? resolveResultsArray(data, episodesRefs)
-    : [];
-
-  const categoryRaw = get("category");
-  const category = categoryRaw && typeof categoryRaw === "object" ? categoryRaw : null;
-
-  return {
-    id: get("id"),
-    title: get("title"),
-    slug: get("slug"),
-    synopsis: get("synopsis"),
-    status: get("status"),
-    episodesCount: get("episodesCount"),
-    score: get("score"),
-    votes: get("votes"),
-    malId: get("malId"),
-    startDate: get("startDate"),
-    poster: get("poster"),
-    category,
-    genres,
-    episodes,
-  };
+  return find(nodeData && nodeData.decoded);
 }
 
 function buildEpisodesList(mediaData) {
-  if (!mediaData || !mediaData.episodes || !Array.isArray(mediaData.episodes)) {
-    return [];
+  if (!mediaData || !Array.isArray(mediaData.episodes)) return [];
+  const slug = mediaData.slug;
+  const episodes = new Map();
+  for (const entry of mediaData.episodes) {
+    const ep = typeof entry === "number" ? { number: entry } : entry;
+    if (!ep || typeof ep !== "object") continue;
+    const number = parseEpisodeNumber(ep.number);
+    if (number === null) continue;
+    if (ep.media && ep.media.slug && ep.media.slug !== slug) continue;
+    if (ep.mediaId != null && mediaData.id != null && String(ep.mediaId) !== String(mediaData.id)) continue;
+    if (ep.url) {
+      const identity = parseAnimeUrl(ep.url, `https://${DEFAULT_DOMAIN}`);
+      if (!identity || identity.slug !== slug || identity.episode !== number) continue;
+    }
+    const existing = episodes.get(number);
+    if (!existing || (existing.id === null && ep.id != null)) {
+      episodes.set(number, {
+        id: ep.id ?? null,
+        number,
+        title: `Episodio ${number}`,
+        url: `https://${DEFAULT_DOMAIN}/media/${slug}/${number}`,
+      });
+    }
   }
-
-  const slug = mediaData.slug || "";
-  return mediaData.episodes
-    .filter((ep) => ep && ep.number && ep.id)
-    .map((ep) => ({
-      id: ep.id,
-      number: ep.number,
-      title: `Episodio ${ep.number}`,
-      url: `https://${DEFAULT_DOMAIN}/ver/${slug}-${ep.number}`,
-    }));
+  return [...episodes.values()].sort((a, b) => a.number - b.number);
 }
 
-function slugFromUrl(url) {
-  try {
-    const pathname = new URL(url).pathname;
-    const segments = pathname.split("/").filter(Boolean);
-    const lastSegment = segments[segments.length - 1] || "";
-    return lastSegment.replace(/-\d+$/, "");
-  } catch (_error) {
-    return null;
+function findEpisodeNodes(parsedNodes, slug, episodeNumber) {
+  const candidates = [];
+  const invalidNodes = new Set();
+  const mediaIds = new Set();
+  function findMediaId(value, visited) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || visited.has(value)) return;
+    visited.add(value);
+    if (value.media && value.media.slug === slug && value.media.id != null) {
+      mediaIds.add(String(value.media.id));
+    }
+    findMediaId(value.episode, visited);
+    findMediaId(value.data, visited);
   }
+  for (const node of parsedNodes) {
+    if (node) findMediaId(node.decoded, new Set());
+  }
+  const knownMediaId = mediaIds.size === 1 ? [...mediaIds][0] : null;
+  function visit(value, context, visited, nodeIndex) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || visited.has(value)) return;
+    visited.add(value);
+    const nestedEpisode = value.episode && typeof value.episode === "object" ? value.episode : null;
+    const media = value.media || (nestedEpisode && nestedEpisode.media);
+    const mediaSlug = (media && media.slug) || value.mediaSlug || value.animeSlug || context.slug;
+    const rawNumber = value.number ?? value.episodeNumber ?? (nestedEpisode && nestedEpisode.number) ??
+      (typeof value.episode === "number" ? value.episode : context.number);
+    const number = rawNumber == null ? null : parseEpisodeNumber(rawNumber);
+    const mediaId = media && media.id != null ? String(media.id) : context.mediaId;
+    const ownerIds = [value.mediaId, nestedEpisode && nestedEpisode.mediaId];
+    if ((mediaSlug && mediaSlug !== slug) ||
+        (rawNumber != null && number !== episodeNumber) ||
+        (value.slug && value.slug !== slug && value.slug !== `${slug}-${episodeNumber}`) ||
+        (mediaId != null && context.mediaId != null && mediaId !== context.mediaId) ||
+        (mediaId != null && ownerIds.some((id) => id != null && String(id) !== mediaId))) {
+      // An invalid child also invalidates links attached to its ancestor wrapper.
+      invalidNodes.add(nodeIndex);
+      return;
+    }
+
+    const identity = { slug: mediaSlug || (value.slug ? slug : null), number, mediaId };
+    if (value.embeds || value.downloads) {
+      candidates.push({ decoded: value, nodeIndex, score: Number(Boolean(identity.slug)) + Number(number !== null) });
+    }
+    visit(nestedEpisode, identity, visited, nodeIndex);
+    visit(value.data, identity, visited, nodeIndex);
+  }
+  for (const [index, node] of parsedNodes.entries()) {
+    if (node) visit(node.decoded, { mediaId: knownMediaId }, new Set(), index);
+  }
+  const lastDataIndex = parsedNodes.reduce((last, node, index) => node ? index : last, -1);
+  return candidates.filter((candidate) => !invalidNodes.has(candidate.nodeIndex) &&
+    (candidate.score > 0 || candidate.nodeIndex === lastDataIndex));
+}
+
+function parseLinksFromNodes(nodes, field, baseUrl) {
+  const result = { SUB: [], DUB: [] };
+  const fieldNodes = nodes.filter((node) => node.decoded[field]);
+  const bestScore = Math.max(-1, ...fieldNodes.map((node) => node.score));
+  const lastIndex = Math.max(-1, ...fieldNodes.map((node) => node.nodeIndex));
+  // Layout data may expose generic links. Prefer identified episode data; if the
+  // route omits identity, only its deepest data node is a reliable fallback.
+  const selectedIndexes = new Set(fieldNodes.filter((node) => node.score === bestScore &&
+    (bestScore > 0 || node.nodeIndex === lastIndex)).map((node) => node.nodeIndex));
+  // One route node can split SUB and DUB between its wrapper and episode object.
+  const selected = fieldNodes.filter((node) => selectedIndexes.has(node.nodeIndex));
+  function collect(value, variant, visited) {
+    if (!value || typeof value !== "object" || visited.has(value)) return;
+    visited.add(value);
+    if (Array.isArray(value)) {
+      for (const entry of value) collect(entry, variant, visited);
+    } else if (typeof value.url === "string") {
+      const language = normalizeVariant(value.lang || value.language || value.variant, variant);
+      const server = value.server || (field === "downloads" ? "Download" : "Unknown");
+      addServerLink(result, language, server, value.url, baseUrl,
+        field === "downloads" ? value.quality || server : null);
+    } else {
+      for (const [key, entries] of Object.entries(value)) {
+        collect(entries, normalizeVariant(key, variant), visited);
+      }
+    }
+    // A referenced group can legitimately be present under both SUB and DUB.
+    visited.delete(value);
+  }
+  for (const node of selected) collect(node.decoded[field], "SUB", new Set());
+  return result;
 }
 
 // Public API
@@ -427,22 +313,21 @@ async function searchAnime(query, domainCandidate) {
 }
 
 async function getAnimeInfo(urlCandidate) {
-  const slug = slugFromUrl(urlCandidate);
-  if (!slug) {
+  const identity = parseAnimeUrl(urlCandidate);
+  if (!identity) {
     throw new ApiError(400, "URL invalida");
   }
+  const { slug } = identity;
 
   const apiUrl = `https://${DEFAULT_DOMAIN}/media/${slug}/__data.json`;
   const data = await fetchJson(apiUrl);
 
   const parsedNodes = parseSvelteKitNodes(data.nodes);
-  const mediaNode = parsedNodes && parsedNodes.length > 2 ? parsedNodes[2] : null;
-
-  if (!mediaNode) {
+  const mediaData = parsedNodes.map((node) => parseMediaFromNode(node, slug))
+    .filter(Boolean).sort((a, b) => Number(Array.isArray(b.episodes)) - Number(Array.isArray(a.episodes)))[0];
+  if (!mediaData) {
     throw new ApiError(404, "Anime no encontrado en HentaiLA");
   }
-
-  const mediaData = parseMediaFromNode(mediaNode);
   const episodes = buildEpisodesList(mediaData);
 
   return {
@@ -478,80 +363,34 @@ async function getAnimeInfo(urlCandidate) {
   };
 }
 
-async function getEpisodeLinks(urlCandidate) {
-  const slug = slugFromUrl(urlCandidate);
-  const episodeNumber = parseEpisodeNumberFromUrl(urlCandidate);
-
-  if (!slug || !episodeNumber) {
+async function getEpisodeLinks(urlCandidate, includeMega = "false", excludeServers = "") {
+  const identity = parseAnimeUrl(urlCandidate);
+  if (!identity || identity.episode === null) {
     throw new ApiError(400, "URL invalida - no se pudo extraer slug y numero de episodio");
   }
+  const { slug, episode: episodeNumber } = identity;
 
   const apiUrl = `https://${DEFAULT_DOMAIN}/media/${slug}/${episodeNumber}/__data.json`;
   const data = await fetchJson(apiUrl);
 
   const parsedNodes = parseSvelteKitNodes(data.nodes);
 
-  // Find episode node - resolve nested schemas
-  let episodeNode = null;
-  for (let i = parsedNodes ? parsedNodes.length - 1 : 0; i >= 0; i--) {
-    const node = parsedNodes[i];
-    if (!node || !node.schema) continue;
-
-    const data = node.values;
-
-    // Check if this node has embeds or downloads, OR has a nested schema pointing to episode data
-    for (const [key, idx] of Object.entries(node.schema)) {
-      if (typeof idx !== "number") continue;
-
-      // Direct keys
-      if (key === "embeds" || key === "downloads" || key === "episode") {
-        episodeNode = node;
-        break;
-      }
-
-      // Nested schema pattern
-      if (typeof data[idx] === "object" && data[idx] !== null && !Array.isArray(data[idx])) {
-        const inner = data[idx];
-        if (inner.embeds !== undefined || inner.downloads !== undefined || inner.episode !== undefined) {
-          episodeNode = { schema: inner, values: data };
-          break;
-        }
-      }
-    }
-
-    if (episodeNode) break;
+  const episodeNodes = findEpisodeNodes(parsedNodes, slug, episodeNumber);
+  const embeds = parseLinksFromNodes(episodeNodes, "embeds", urlCandidate);
+  const downloads = parseLinksFromNodes(episodeNodes, "downloads", urlCandidate);
+  for (const variant of ["SUB", "DUB"]) {
+    embeds[variant] = filterServerLinks(embeds[variant], includeMega, excludeServers);
+    downloads[variant] = filterServerLinks(downloads[variant], includeMega, excludeServers);
   }
-
-  if (!episodeNode) {
-    return {
-      success: true,
-      data: {
-        id: null,
-        episode: episodeNumber,
-        title: `Episodio ${episodeNumber}`,
-        season: null,
-        variants: { SUB: 0, DUB: 0 },
-        publishedAt: null,
-        servers: { sub: [], dub: [] },
-        streamLinks: { SUB: [], DUB: [] },
-        downloadLinks: { SUB: [], DUB: [] },
-      },
-      source: "hentaila",
-    };
-  }
-
-  const embeds = parseEmbedsFromNode(episodeNode);
-  const downloads = parseDownloadsFromNode(episodeNode);
-  const epData = resolveNodeObject(episodeNode, ["title", "number"]);
+  const epData = episodeNodes.slice().sort((a, b) => b.score - a.score)
+    .map((node) => node.decoded).find((value) => value.title);
 
   return {
     success: true,
     data: {
       id: null,
       episode: episodeNumber,
-      title: (embeds.SUB.length > 0 || downloads.SUB.length > 0)
-        ? (epData ? epData.title || `Episodio ${episodeNumber}` : `Episodio ${episodeNumber}`)
-        : `Episodio ${episodeNumber}`,
+      title: epData ? epData.title : `Episodio ${episodeNumber}`,
       season: null,
       variants: {
         SUB: embeds.SUB.length > 0 || downloads.SUB.length > 0 ? 1 : 0,

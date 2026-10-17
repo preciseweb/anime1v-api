@@ -1,0 +1,25 @@
+<!doctype html>
+<html><body>
+  <h1>Example 2 - 1.5</h1>
+  <script>
+    var videosBackup = {SUB: [{title: "Wrong", code: "https://video.example/wrong"}]};
+    const videos = {
+      SUB: [
+        {title: "Sub A", code: "https://video.example/sub-a"},
+        {title: "Sub B", code: "aHR0cHM6Ly92aWRlby5leGFtcGxlL3N1Yi1i"},
+        {title: "Shared", url: "https://video.example/shared"},
+        {title: "Duplicate", code: "https://video.example/sub-a"},
+        {title: "Mega", code: "https://video.example/mega"}
+      ],
+      LAT: [{title: "Dub A", embed: "https://video.example/dub-a"}],
+      DUB: [
+        {title: "Dub B", file: "https://video.example/dub-b"},
+        {title: "Shared", code: "https://video.example/shared"}
+      ]
+    };
+  </script>
+  <table><tbody>
+    <tr><td>Download SUB</td><td>720p</td><td>SUB</td><td><a href="https://download.example/sub">Download</a></td></tr>
+    <tr><td>Download LAT</td><td>1080p</td><td>Latino</td><td><a href="https://download.example/dub">Download</a></td></tr>
+  </tbody></table>
+</body></html>

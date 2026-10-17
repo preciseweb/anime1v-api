@@ -232,6 +232,9 @@ function detectDomain(urlCandidate) {
 }
 
 function parseNumber(value) {
+  if ((typeof value !== "number" && typeof value !== "string") || String(value).trim() === "") {
+    return null;
+  }
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
   }
@@ -243,12 +246,53 @@ function parseEpisodeNumberFromUrl(url) {
   try {
     const pathname = new URL(url).pathname;
     const segments = pathname.split("/").filter(Boolean);
-    const lastSegment = segments[segments.length - 1] || "";
-    const number = Number(lastSegment);
-    return Number.isFinite(number) ? number : null;
+    return segments[0] === "media" && segments.length === 3 ? parseNumber(segments[2]) : null;
   } catch (_error) {
     return null;
   }
+}
+
+function mediaSlugFromUrl(value, domain = DEFAULT_DOMAIN) {
+  try {
+    const url = new URL(value, `https://${domain}`);
+    const segments = url.pathname.split("/").filter(Boolean);
+    return segments[0] === "media" && segments[1] ? decodeURIComponent(segments[1]) : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function mediaSlugFromObject(value, domain) {
+  if (!isObject(value)) return null;
+  const slug = value.mediaSlug || value.media_slug || value.animeSlug || value.anime_slug || value.slug;
+  if (typeof slug === "string" && slug.trim()) {
+    if (!slug.includes("/")) return slug.trim();
+    return mediaSlugFromUrl(slug, domain);
+  }
+  return mediaSlugFromUrl(value.url || value.href || value.link, domain);
+}
+
+// Only descend through page objects, never recommendation or episode collections.
+function pageDataObjects(root, objects = [], seen = new Set()) {
+  if (!root || typeof root !== "object" || seen.has(root)) return objects;
+  seen.add(root);
+  if (Array.isArray(root)) {
+    root.forEach((entry) => pageDataObjects(entry, objects, seen));
+    return objects;
+  }
+  objects.push(root);
+  for (const [key, child] of Object.entries(root)) {
+    if (/recommend|related|similar|suggest|sidebar|latest|recent|popular|trending|^episodes$|^episodeList$/i.test(key)) continue;
+    if (/^(streamLinks|downloadLinks|servers|variants|sub|dub)$/i.test(key)) continue;
+    if (isObject(child) || (key === "data" && Array.isArray(child))) {
+      pageDataObjects(child, objects, seen);
+    }
+  }
+  return objects;
+}
+
+function episodeNumber(episode) {
+  return parseNumber(episode.number) ?? parseNumber(episode.episode) ?? parseNumber(episode.ep) ?? parseNumber(episode.order);
 }
 
 function normalizeServerName(serverName, url) {
@@ -286,8 +330,9 @@ function normalizeLinkObject(entry, domain) {
   }
 
   if (typeof entry === "string") {
+    if (!/^(?:https?:\/\/|\/)|\//i.test(entry)) return null;
     const url = resolveAbsoluteUrl(entry, domain);
-    if (!url) {
+    if (!url || !/^https?:\/\//i.test(url)) {
       return null;
     }
     const server = normalizeServerName("", url);
@@ -315,7 +360,7 @@ function normalizeLinkObject(entry, domain) {
     null;
 
   const url = resolveAbsoluteUrl(urlCandidate, domain);
-  if (!url) {
+  if (!url || !/^https?:\/\//i.test(url)) {
     return null;
   }
 
@@ -362,73 +407,55 @@ function pushDeduped(target, link) {
   }
 }
 
-function parseVariantContainer(container, kindHint, domain, collector) {
-  if (!isObject(container)) {
+function normalizeVariant(value) {
+  if (typeof value !== "string") return null;
+  const token = value.trim().toLowerCase();
+  if (/^(sub|subbed|subtitulado|subtitulados)$/.test(token)) return "SUB";
+  if (/^(dub|dubbed|doblado|latino|lat)$/.test(token)) return "DUB";
+  return null;
+}
+
+function parseVariantContainer(container, kindHint, domain, collector, variantHint = null, serverHint = null) {
+  if (Array.isArray(container)) {
+    for (const entry of container) {
+      parseVariantContainer(entry, kindHint, domain, collector, variantHint, serverHint);
+    }
     return;
   }
+  if (!container || (typeof container !== "string" && !isObject(container))) return;
 
-  const variantPairs = [
-    ["SUB", container.SUB ?? container.sub],
-    ["DUB", container.DUB ?? container.dub],
-  ];
-
-  for (const [variant, value] of variantPairs) {
-    if (!value) {
-      continue;
+  const explicitVariant = isObject(container) ? container.variant || container.language || container.lang : null;
+  const variant = explicitVariant ? normalizeVariant(explicitVariant) : variantHint;
+  const link = normalizeLinkObject(container, domain);
+  if (link) {
+    if (!variant) return;
+    if (serverHint && (!isObject(container) || !(container.server || container.name || container.provider || container.host))) {
+      const server = normalizeServerName(serverHint, link.url);
+      link.server = server.name;
+      link.token = server.token;
     }
+    const kind = kindHint || (container.downloadUrl ? "download" : container.streamUrl ? "stream" : null);
+    pushDeduped(collector[inferLinkKind(link.url, kind)][variant], link);
+    return;
+  }
+  if (!isObject(container)) return;
 
-    if (Array.isArray(value)) {
-      for (const entry of value) {
-        const normalized = normalizeLinkObject(entry, domain);
-        if (!normalized) {
-          continue;
-        }
-        const kind = inferLinkKind(normalized.url, kindHint);
-        pushDeduped(collector[kind][variant], normalized);
-      }
-      continue;
-    }
-
-    if (isObject(value)) {
-      for (const [childKey, childValue] of Object.entries(value)) {
-        if (!Array.isArray(childValue)) {
-          const normalized = normalizeLinkObject(childValue, domain);
-          if (!normalized) {
-            continue;
-          }
-          const childKind =
-            /download/i.test(childKey) ? "download" : /stream|embed|server/i.test(childKey) ? "stream" : inferLinkKind(normalized.url, kindHint);
-          pushDeduped(collector[childKind][variant], normalized);
-          continue;
-        }
-
-        const childKind =
-          /download/i.test(childKey) ? "download" : /stream|embed|server/i.test(childKey) ? "stream" : kindHint || "stream";
-
-        for (const entry of childValue) {
-          const normalized = normalizeLinkObject(entry, domain);
-          if (!normalized) {
-            continue;
-          }
-          const inferredKind = inferLinkKind(normalized.url, childKind);
-          pushDeduped(collector[inferredKind][variant], normalized);
-        }
-      }
-    }
+  for (const [key, value] of Object.entries(container)) {
+    if (/^(id|variant|language|lang|quality|resolution|label|name|title|server|provider|host|size)$/i.test(key)) continue;
+    if (/recommend|related|similar|suggest|^episodes$|^episodeList$/i.test(key)) continue;
+    const childVariant = normalizeVariant(key);
+    const childKind = /download/i.test(key) ? "download" : /stream|embed|server/i.test(key) ? "stream" : kindHint;
+    parseVariantContainer(value, childKind, domain, collector, childVariant || variant, childVariant || childKind !== kindHint ? null : key);
   }
 }
 
-function extractLinksFromData(dataRoot, html, domain) {
+function extractLinksFromData(roots, html, domain) {
   const collector = {
     stream: { SUB: [], DUB: [] },
     download: { SUB: [], DUB: [] },
   };
 
-  walk(dataRoot, (node) => {
-    if (!isObject(node)) {
-      return;
-    }
-
+  for (const node of roots) {
     if (node.streamLinks) {
       parseVariantContainer(node.streamLinks, "stream", domain, collector);
     }
@@ -441,29 +468,28 @@ function extractLinksFromData(dataRoot, html, domain) {
       parseVariantContainer(node.servers, "stream", domain, collector);
     }
 
-    const hasVariantShape =
-      Object.prototype.hasOwnProperty.call(node, "SUB") ||
-      Object.prototype.hasOwnProperty.call(node, "sub") ||
-      Object.prototype.hasOwnProperty.call(node, "DUB") ||
-      Object.prototype.hasOwnProperty.call(node, "dub");
+    parseVariantContainer({ SUB: node.SUB ?? node.sub, DUB: node.DUB ?? node.dub }, null, domain, collector);
+    if (node.variants) parseVariantContainer(node.variants, null, domain, collector);
+  }
 
-    if (hasVariantShape) {
-      parseVariantContainer(node, null, domain, collector);
-    }
-  });
-
-  if (collector.stream.SUB.length === 0 && collector.download.SUB.length === 0 && typeof html === "string") {
-    const foundUrls = html.match(VIDEO_URL_REGEX) || [];
-    for (const rawUrl of foundUrls) {
-      const url = resolveAbsoluteUrl(rawUrl, domain);
-      if (!url) {
-        continue;
-      }
-      const server = normalizeServerName("", url);
-      const link = { server: server.name, token: server.token, url, quality: null };
-      const kind = inferLinkKind(url);
-      pushDeduped(collector[kind].SUB, link);
-    }
+  // HTML fallback is limited to player/download elements, not every URL in scripts or recommendations.
+  if (typeof html === "string") {
+    const hasStructuredLinks = Object.values(collector).some((kind) => kind.SUB.length || kind.DUB.length);
+    const $ = cheerio.load(html);
+    $("aside, nav, .related, .recommendations, .sidebar").remove();
+    $("[data-variant], [data-language], #player, .player, .downloads, .download-links").each((_, element) => {
+      const container = $(element);
+      container.find("a[href], iframe[src], video[src], source[src]").addBack("a[href], iframe[src], video[src], source[src]").each((_, linkElement) => {
+        const item = $(linkElement);
+        const languageContainer = item.closest("[data-variant], [data-language]");
+        const language = languageContainer.attr("data-variant") || languageContainer.attr("data-language");
+        const variant = language ? normalizeVariant(language) : hasStructuredLinks ? null : "SUB";
+        const url = item.attr("href") || item.attr("src");
+        if (!variant || !url || !(url.match(VIDEO_URL_REGEX) || /\.(mp4|m3u8)(?:[?#]|$)/i.test(url))) return;
+        const kind = item.is("iframe, video, source") ? "stream" : inferLinkKind(url);
+        parseVariantContainer({ [variant]: [url] }, kind, domain, collector);
+      });
+    });
   }
 
   return collector;
@@ -517,24 +543,25 @@ function sanitizeLinksForResponse(links) {
   });
 }
 
-function chooseBestMediaCandidate(dataRoot) {
-  const candidates = collectValuesByKey(dataRoot, "media").filter(isObject);
-
-  walk(dataRoot, (node) => {
-    if (!isObject(node)) {
-      return;
+function chooseBestMediaCandidate(dataRoot, requestedUrl, domain) {
+  const requestedSlug = mediaSlugFromUrl(requestedUrl, domain);
+  const candidates = new Set();
+  for (const node of pageDataObjects(dataRoot)) {
+    if (isObject(node.media)) candidates.add(node.media);
+    if (typeof node.title === "string" && (Array.isArray(node.episodes) || Array.isArray(node.episodeList) || node.description)) {
+      candidates.add(node);
     }
-
-    if (typeof node.title === "string" && (Array.isArray(node.episodes) || node.description)) {
-      candidates.push(node);
-    }
-  });
+  }
 
   let best = null;
   let bestScore = -1;
 
   for (const candidate of candidates) {
+    const slug = mediaSlugFromObject(candidate, domain);
+    if (requestedSlug && slug && slug !== requestedSlug) continue;
     let score = 0;
+    // An exact identity always wins over richer metadata from an anonymous object.
+    if (requestedSlug && slug === requestedSlug) score += 100;
     if (typeof candidate.title === "string") score += 3;
     if (Array.isArray(candidate.episodes)) score += 3;
     if (Array.isArray(candidate.genres)) score += 1;
@@ -581,28 +608,37 @@ function normalizeGenres(genres) {
     .filter((genre) => genre && genre.name);
 }
 
-function normalizeEpisodes(episodes, domain, slug) {
+function normalizeEpisodes(episodes, domain, slug, mediaId) {
   if (!Array.isArray(episodes)) {
     return [];
   }
 
+  const seenEpisodes = new Set();
   return episodes
-    .map((episode, index) => {
+    .map((episode) => {
       if (!isObject(episode)) {
         return null;
       }
 
-      const inferredNumber =
-        parseNumber(episode.number) ??
-        parseNumber(episode.episode) ??
-        parseNumber(episode.ep) ??
-        parseNumber(episode.order) ??
-        index + 1;
-
       let episodeUrl = resolveAbsoluteUrl(episode.url || episode.href || episode.link, domain);
+      const ownerSlug = episode.mediaSlug || episode.media_slug || mediaSlugFromObject(episode.media, domain);
+      const ownerId = episode.mediaId ?? episode.media_id ?? episode.media?.id;
+      if (ownerSlug && slug && ownerSlug !== slug) return null;
+      if (ownerId != null && mediaId != null && String(ownerId) !== String(mediaId)) return null;
+      if (episodeUrl) {
+        const url = new URL(episodeUrl);
+        if (!/^https?:$/.test(url.protocol) || url.hostname.replace(/^www\./, "") !== domain.replace(/^www\./, "")) return null;
+        if (slug && mediaSlugFromUrl(episodeUrl, domain) !== slug) return null;
+      }
+      const urlNumber = episodeUrl ? parseEpisodeNumberFromUrl(episodeUrl) : null;
+      const inferredNumber = episodeNumber(episode) ?? urlNumber;
+      if (inferredNumber === null || inferredNumber < 0) return null;
+      if (episodeUrl && (urlNumber === null || urlNumber !== inferredNumber)) return null;
       if (!episodeUrl && slug && Number.isFinite(inferredNumber)) {
         episodeUrl = resolveAbsoluteUrl(`/media/${slug}/${inferredNumber}`, domain);
       }
+      if (!episodeUrl || seenEpisodes.has(inferredNumber)) return null;
+      seenEpisodes.add(inferredNumber);
 
       return {
         id: episode.id ?? null,
@@ -614,8 +650,9 @@ function normalizeEpisodes(episodes, domain, slug) {
     .filter((episode) => episode && episode.url);
 }
 
-function normalizeAnimeInfo(media, domain) {
-  const episodes = normalizeEpisodes(media.episodes || media.episodeList || [], domain, media.slug);
+function normalizeAnimeInfo(media, domain, requestedUrl) {
+  const slug = mediaSlugFromUrl(requestedUrl, domain) || mediaSlugFromObject(media, domain);
+  const episodes = normalizeEpisodes(media.episodes || media.episodeList || [], domain, slug, media.id);
 
   return {
     id: media.id ?? null,
@@ -824,14 +861,72 @@ function parseSearchResultsFromHtml(html, domain) {
   return unique;
 }
 
-function firstObjectByKey(dataRoot, keyName) {
-  const values = collectValuesByKey(dataRoot, keyName);
-  for (const value of values) {
-    if (isObject(value)) {
-      return value;
+function selectEpisodeData(dataRoot, requestedUrl, domain) {
+  const requestedSlug = mediaSlugFromUrl(requestedUrl, domain);
+  const requestedNumber = parseEpisodeNumberFromUrl(requestedUrl);
+  const scopes = pageDataObjects(dataRoot);
+  const candidates = [];
+  const rejected = new Set();
+  const rejectScope = (scope) => walk(scope, (node) => rejected.add(node));
+
+  for (const scope of scopes) {
+    const mediaSlug = mediaSlugFromObject(scope.media, domain);
+    if (requestedSlug && mediaSlug && mediaSlug !== requestedSlug) {
+      rejectScope(scope);
+      continue;
+    }
+    if (isObject(scope.episode)) candidates.push({ episode: scope.episode, owner: scope });
+    if (episodeNumber(scope) !== null && (scope.streamLinks || scope.downloadLinks || scope.servers || scope.variants || scope.SUB || scope.DUB)) {
+      candidates.push({ episode: scope, owner: scope });
+    }
+    if (mediaSlug === requestedSlug && isObject(scope.media)) {
+      const episodes = scope.media.episodes || scope.media.episodeList;
+      for (const episode of Array.isArray(episodes) ? episodes : []) {
+        if (isObject(episode)) candidates.push({ episode, owner: scope.media });
+      }
     }
   }
-  return null;
+
+  const matches = [];
+  for (const candidate of candidates) {
+    const { episode, owner } = candidate;
+    if (rejected.has(episode) || rejected.has(owner)) continue;
+    const episodeUrl = resolveAbsoluteUrl(episode.url || episode.href || episode.link, domain);
+    const slug = episode.mediaSlug || episode.media_slug || mediaSlugFromObject(episode.media, domain) ||
+      (episodeUrl ? mediaSlugFromUrl(episodeUrl, domain) : null) || mediaSlugFromObject(owner.media, domain) ||
+      (Array.isArray(owner.episodes) || Array.isArray(owner.episodeList) ? mediaSlugFromObject(owner, domain) : null);
+    const ownerMediaId = owner.media?.id ?? (Array.isArray(owner.episodes) || Array.isArray(owner.episodeList) ? owner.id : null);
+    const episodeMediaId = episode.mediaId ?? episode.media_id ?? episode.media?.id;
+    const number = episodeNumber(episode) ?? (episodeUrl ? parseEpisodeNumberFromUrl(episodeUrl) : null);
+    if ((requestedSlug && slug && slug !== requestedSlug) ||
+        (ownerMediaId != null && episodeMediaId != null && String(ownerMediaId) !== String(episodeMediaId)) ||
+        (number !== null && requestedNumber !== null && number !== requestedNumber)) {
+      // A mismatching episode must not contribute its sibling link containers either.
+      if (owner.episode === episode) rejectScope(owner);
+      else rejected.add(episode);
+      continue;
+    }
+    if (episodeUrl && (mediaSlugFromUrl(episodeUrl, domain) !== requestedSlug || parseEpisodeNumberFromUrl(episodeUrl) !== requestedNumber)) continue;
+    matches.push({ ...candidate, number, score: (slug === requestedSlug ? 10 : 0) + (number === requestedNumber ? 5 : 0) });
+  }
+
+  const valid = matches.filter(({ episode, owner }) => !rejected.has(episode) && !rejected.has(owner));
+  valid.sort((left, right) => right.score - left.score);
+  const selected = valid[0];
+  if (selected) {
+    const roots = new Set();
+    for (const candidate of valid) {
+      if (candidate !== selected && candidate.number !== requestedNumber) continue;
+      roots.add(candidate.episode);
+      // Lists on a media object belong to many episodes; only a page's direct episode owns its sibling links.
+      if (candidate.owner.episode === candidate.episode || candidate.owner === candidate.episode) roots.add(candidate.owner);
+    }
+    return { episode: selected.episode, roots: [...roots], allowHtmlFallback: true };
+  }
+
+  // Some payloads expose only page-level links, without a separate episode object.
+  const roots = candidates.length === 0 ? scopes.filter((scope) => !rejected.has(scope)) : [];
+  return { episode: {}, roots, allowHtmlFallback: candidates.length === 0 && rejected.size === 0 };
 }
 
 function parseBoolean(value) {
@@ -851,14 +946,14 @@ async function getAnimeInfo(urlCandidate) {
     throw new ApiError(500, "No se pudo extraer informacion del anime");
   }
 
-  const media = chooseBestMediaCandidate(svelteData);
+  const media = chooseBestMediaCandidate(svelteData, normalizedUrl, domain);
   if (!media) {
     throw new ApiError(404, "No se encontro informacion del anime");
   }
 
   return {
     success: true,
-    data: normalizeAnimeInfo(media, domain),
+    data: normalizeAnimeInfo(media, domain, normalizedUrl),
     source: "json",
   };
 }
@@ -925,12 +1020,13 @@ async function getEpisodeLinks(urlCandidate, includeMegaRaw, excludeServersRaw) 
   const includeMega = parseBoolean(includeMegaRaw);
   const excludedTokens = buildExcludedTokens(includeMega, excludeServersRaw);
 
-  const html = await fetchHtml(urlCandidate);
+  const html = await fetchHtml(normalizedUrl);
   const svelteData = extractSvelteData(html);
   const dataRoot = svelteData || {};
 
-  const episodeObject = firstObjectByKey(dataRoot, "episode") || {};
-  const links = extractLinksFromData(dataRoot, html, domain);
+  const selected = selectEpisodeData(dataRoot, normalizedUrl, domain);
+  const episodeObject = selected.episode;
+  const links = extractLinksFromData(selected.roots, selected.allowHtmlFallback ? html : null, domain);
 
   const filteredStreamSub = filterLinksByServers(links.stream.SUB, excludedTokens);
   const filteredStreamDub = filterLinksByServers(links.stream.DUB, excludedTokens);
@@ -942,10 +1038,9 @@ async function getEpisodeLinks(urlCandidate, includeMegaRaw, excludeServersRaw) 
     data: {
       id: episodeObject.id ?? null,
       episode:
-        parseNumber(episodeObject.number) ||
-        parseNumber(episodeObject.episode) ||
+        episodeNumber(episodeObject) ??
         parseEpisodeNumberFromUrl(normalizedUrl),
-      title: episodeObject.title || `Episodio ${parseEpisodeNumberFromUrl(normalizedUrl) || "?"}`,
+      title: episodeObject.title || `Episodio ${parseEpisodeNumberFromUrl(normalizedUrl) ?? "?"}`,
       season: episodeObject.season ?? null,
       variants: {
         SUB: filteredStreamSub.length > 0 || filteredDownloadSub.length > 0 ? 1 : 0,

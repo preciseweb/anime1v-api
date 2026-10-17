@@ -142,6 +142,11 @@
             
             <div class="server-selection-panel">
               <h4><i class="fa-solid fa-satellite-dish"></i> Servidores Disponibles</h4>
+              <div class="variant-selector" role="group" aria-label="Idioma del episodio">
+                <button id="variant-sub-btn" class="variant-btn" aria-pressed="false" disabled>SUB · Subtitulado (…)</button>
+                <button id="variant-dub-btn" class="variant-btn" aria-pressed="false" disabled>DUB · Doblado (…)</button>
+              </div>
+              <p id="variant-status" class="variant-status" role="status" aria-live="polite">Consultando disponibilidad de idiomas…</p>
               <div class="servers-list" id="servers-list"></div>
             </div>
           </div>

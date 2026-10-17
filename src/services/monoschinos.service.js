@@ -2,6 +2,7 @@ const axios = require("axios");
 const cheerio = require("cheerio");
 const { URL } = require("node:url");
 const { ApiError } = require("../utils/api-error");
+const { normalizeVariant, filterServerLinks, addServerLink } = require("../utils/episode-links");
 
 const DEFAULT_DOMAIN = "monoschinos2.com";
 
@@ -37,7 +38,7 @@ function parseEpisodeNumberFromUrl(url) {
     const segments = new URL(url).pathname.split("/").filter(Boolean);
     const lastSegment = segments[segments.length - 1] || "";
     // format: anime-name-episodio-1
-    const match = lastSegment.match(/-episodio-(\d+)$/);
+    const match = lastSegment.match(/-episodio-(\d+(?:\.\d+)?)$/);
     return match ? Number(match[1]) : null;
   } catch (_) {
     return null;
@@ -51,7 +52,7 @@ function slugFromUrl(url) {
     if (url.includes("/anime/")) {
       return lastSegment;
     }
-    return lastSegment.replace(/-episodio-\d+$/, "");
+    return lastSegment.replace(/-episodio-\d+(?:\.\d+)?$/, "");
   } catch (_) {
     return null;
   }
@@ -120,7 +121,16 @@ async function getAnimeInfo(urlCandidate) {
   const image = $("img.lazy").attr("data-src") || $("img").first().attr("src");
 
   const episodes = [];
-  let epsFoundFromAjax = false;
+  const addEpisode = (rawUrl) => {
+    try {
+      const url = new URL(rawUrl, animeUrl);
+      const number = parseEpisodeNumberFromUrl(url.href);
+      if (number === null || !/^https?:$/.test(url.protocol) ||
+          url.hostname.replace(/^www\./, "") !== new URL(animeUrl).hostname.replace(/^www\./, "") ||
+          url.pathname.replace(/\/$/, "") !== `/ver/${slug}-episodio-${number}`) return;
+      episodes.push({ id: null, number, title: `Episodio ${number}`, url: url.href });
+    } catch (_) {}
+  };
 
   const csrfMatch = html.match(/name="csrf-token"\s+content="([^"]+)"/i);
   const axMatch = html.match(/(https?:\/\/[^\s"'<>]+\/ajax_pagination\/\d+)/i);
@@ -136,7 +146,6 @@ async function getAnimeInfo(urlCandidate) {
       const pData = axResponse.data;
 
       if (pData && pData.paginate_url && Array.isArray(pData.eps)) {
-        epsFoundFromAjax = true;
         const totalEps = pData.eps.length;
         const perPage = pData.perpage || 50;
         const totalPages = Math.ceil(totalEps / perPage);
@@ -146,15 +155,7 @@ async function getAnimeInfo(urlCandidate) {
           const epsPage = await axios.post(epsUrl, null, { headers: reqHeaders });
           if (epsPage.data && epsPage.data.caps && Array.isArray(epsPage.data.caps)) {
             for (const cap of epsPage.data.caps) {
-              const number = Number(cap.episodio);
-              if (cap.url && number) {
-                episodes.push({
-                  id: null,
-                  number,
-                  title: `Episodio ${number}`,
-                  url: cap.url,
-                });
-              }
+              if (cap.url) addEpisode(cap.url);
             }
           }
         }
@@ -164,23 +165,11 @@ async function getAnimeInfo(urlCandidate) {
     }
   }
 
-  // Fallback si no se encontró paginación
-  if (!epsFoundFromAjax) {
-    $("a[href*='/ver/']").each((_, el) => {
-      const href = $(el).attr("href");
-      if (!href) return;
-      const fullUrl = href.startsWith("http") ? href : `https://${domain}${href}`;
-      const number = parseEpisodeNumberFromUrl(fullUrl);
-      if (number) {
-        episodes.push({
-          id: null,
-          number,
-          title: `Episodio ${number}`,
-          url: fullUrl,
-        });
-      }
-    });
-  }
+  // Complete partial AJAX results with links belonging to this anime only.
+  $("a[href*='/ver/']").each((_, el) => {
+    const href = $(el).attr("href");
+    if (href) addEpisode(href);
+  });
 
   const seen = new Set();
   const sortedEpisodes = episodes
@@ -222,7 +211,7 @@ async function getEpisodeLinks(urlCandidate, includeMega = false, excludeServers
   const slug = slugFromUrl(urlCandidate);
   const episodeNumber = parseEpisodeNumberFromUrl(urlCandidate);
 
-  if (!slug || !episodeNumber) {
+  if (!slug || episodeNumber === null) {
     throw new ApiError(400, "URL invalida - no se pudo extraer slug y numero");
   }
 
@@ -230,28 +219,38 @@ async function getEpisodeLinks(urlCandidate, includeMega = false, excludeServers
   const $ = cheerio.load(html);
 
   const streamLinks = { SUB: [], DUB: [] };
-  const excludeList = (excludeServers || []).map((s) => s.toLowerCase());
+  // Only explicit edition suffixes identify audio; title words such as "es" or
+  // "en" are not language metadata.
+  const pageVariant = /-(?:dub|dubbed|doblad[oa]s?|latino|latam|castellano|espanol)$/i.test(slug) ? "DUB" : "SUB";
+  const isPlayerUrl = /^(?:https?:\/\/|\/|\.\.?\/)/i;
   
   $(".play-video").each((_, el) => {
     const serverName = $(el).text().trim().toLowerCase();
     const dataPlayer = $(el).attr("data-player");
     if (!dataPlayer) return;
 
-    if (!includeMega && serverName.includes("mega")) {
-      return;
-    }
-
-    if (excludeList.some((ex) => serverName.includes(ex))) {
-      return;
-    }
-
     try {
-      const url = Buffer.from(dataPlayer, 'base64').toString('utf8');
-      if (url.startsWith("http")) {
-        streamLinks.SUB.push({ server: serverName, url });
-      }
+      const value = dataPlayer.trim();
+      const url = (isPlayerUrl.test(value) ? value : Buffer.from(value, 'base64').toString('utf8'))
+        .trim().replace(/\\\//g, "/");
+      // Buffer accepts malformed Base64; never turn decoded text into a server
+      // URL relative to the current episode.
+      if (!isPlayerUrl.test(url)) return;
+      const element = $(el);
+      const group = element.closest("[data-language], [data-variant], [data-lang], [data-audio]");
+      const language = ["language", "variant", "lang", "audio"]
+        .map((key) => element.attr(`data-${key}`) || group.attr(`data-${key}`)).find(Boolean);
+      const tab = element.closest(".tab-pane");
+      const groupVariant = normalizeVariant(tab.attr("id"), pageVariant);
+      const variant = normalizeVariant(language, normalizeVariant(serverName, groupVariant));
+      addServerLink(streamLinks, variant, serverName, url, urlCandidate);
     } catch(err) {}
   });
+
+  for (const variant of ["SUB", "DUB"]) {
+    streamLinks[variant] = filterServerLinks(streamLinks[variant], includeMega, excludeServers)
+      .map(({ server, url }) => ({ server, url }));
+  }
 
   const episodeTitle = $("h1").first().text().trim() || `Episodio ${episodeNumber}`;
 
@@ -264,16 +263,16 @@ async function getEpisodeLinks(urlCandidate, includeMega = false, excludeServers
       season: null,
       variants: {
         SUB: streamLinks.SUB.length > 0 ? 1 : 0,
-        DUB: 0,
+        DUB: streamLinks.DUB.length > 0 ? 1 : 0,
       },
       publishedAt: null,
       servers: {
         sub: streamLinks.SUB,
-        dub: [],
+        dub: streamLinks.DUB,
       },
       streamLinks: {
         SUB: streamLinks.SUB,
-        DUB: [],
+        DUB: streamLinks.DUB,
       },
       downloadLinks: {
         SUB: [],

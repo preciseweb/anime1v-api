@@ -83,8 +83,7 @@ function parseEpisodeNumberFromUrl(url) {
     const pathname = new URL(url).pathname;
     const segments = pathname.split("/").filter(Boolean);
     const lastSegment = segments[segments.length - 1] || "";
-    const number = Number(lastSegment);
-    return Number.isFinite(number) ? number : null;
+    return /^\d+(?:\.\d+)?$/.test(lastSegment) ? Number(lastSegment) : null;
   } catch (_error) {
     return null;
   }
@@ -239,26 +238,16 @@ function safeEvaluate(expression) {
 }
 
 function extractVarLiteral(html, varName) {
-  const marker = `var ${varName}`;
-  const startIndex = html.indexOf(marker);
-  if (startIndex === -1) {
+  const escapedName = varName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const declaration = new RegExp(`\\b(?:var|let|const)\\s+${escapedName}\\s*=\\s*([\\[{])`).exec(html);
+  if (!declaration) {
     return null;
   }
 
-  const equalsIndex = html.indexOf("=", startIndex);
-  if (equalsIndex === -1) {
-    return null;
-  }
-
-  const slice = html.slice(equalsIndex + 1);
-  const firstBracketIndex = slice.search(/[\[{]/);
-  if (firstBracketIndex === -1) {
-    return null;
-  }
-
-  const openChar = slice[firstBracketIndex];
+  const startIndex = declaration.index + declaration[0].length - 1;
+  const openChar = declaration[1];
   const closeChar = openChar === "{" ? "}" : "]";
-  return extractBalancedSection(slice, firstBracketIndex, openChar, closeChar);
+  return extractBalancedSection(html, startIndex, openChar, closeChar);
 }
 
 function extractVideoIframeUrls(html) {
@@ -425,54 +414,33 @@ function parseAnimeInfoFromHtml(html, domain) {
 
 function parseEpisodesFromHtml(html, domain, slug) {
   const $ = cheerio.load(html);
-  const episodes = [];
+  const episodes = new Map();
+  const expectedHost = new URL(`https://${domain}`).host.replace(/^www\d*\./, "");
 
-  $("#episodes-content a, .episodes-content a, .list-group a").each((_, element) => {
+  // All containers may hold partial lists; only links belonging to this anime count.
+  $("a[href]").each((_, element) => {
     const link = $(element).attr("href");
     if (!link) {
       return;
     }
 
     const url = resolveAbsoluteUrl(link, domain);
-    if (!url || !/\/\d+\/?$/.test(url)) {
+    if (!url) {
+      return;
+    }
+
+    const parsed = new URL(url);
+    const segments = parsed.pathname.split("/").filter(Boolean);
+    if (!/^https?:$/.test(parsed.protocol) || parsed.host.replace(/^www\d*\./, "") !== expectedHost ||
+        segments.length !== 2 || segments[0] !== slug) {
       return;
     }
 
     const number = parseEpisodeNumberFromUrl(url);
-    episodes.push({
-      id: null,
-      number: number || null,
-      title: number ? `Episodio ${number}` : $(element).text().trim(),
-      url,
-    });
-  });
-
-  if (episodes.length > 0) {
-    return episodes;
-  }
-
-  if (!slug) {
-    return episodes;
-  }
-
-  const episodeLinks = [];
-  $("a").each((_, element) => {
-    const link = $(element).attr("href");
-    if (!link) {
+    if (number === null || episodes.has(number)) {
       return;
     }
-
-    const url = resolveAbsoluteUrl(link, domain);
-    if (!url || !url.includes(`/${slug}/`)) {
-      return;
-    }
-
-    const number = parseEpisodeNumberFromUrl(url);
-    if (!number) {
-      return;
-    }
-
-    episodeLinks.push({
+    episodes.set(number, {
       id: null,
       number,
       title: `Episodio ${number}`,
@@ -480,7 +448,7 @@ function parseEpisodesFromHtml(html, domain, slug) {
     });
   });
 
-  return episodeLinks;
+  return [...episodes.values()].sort((a, b) => a.number - b.number);
 }
 
 function parseToken(html) {
@@ -652,7 +620,7 @@ async function getEpisodeLinks(urlCandidate, includeMegaRaw, excludeServersRaw) 
   if (serversLiteral) {
     const serversData = safeEvaluate(`(${serversLiteral})`);
     if (Array.isArray(serversData)) {
-      const remoteMatch = html.match(/var\s+remote\s*=\s*['"]([^'"]+)['"]/i);
+      const remoteMatch = html.match(/\b(?:var|let|const)\s+remote\s*=\s*['"]([^'"]+)['"]/i);
       const remoteBase = remoteMatch ? remoteMatch[1] : null;
 
       for (const entry of serversData) {

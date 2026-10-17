@@ -103,8 +103,8 @@ function parseEpisodeNumberFromUrl(url) {
     const pathname = new URL(url).pathname;
     const segments = pathname.split("/").filter(Boolean);
     const lastSegment = segments[segments.length - 1] || "";
-    const number = Number(lastSegment.match(/(\d+)(?:\D*)$/)?.[1]);
-    return Number.isFinite(number) ? number : null;
+    const match = lastSegment.match(/-(\d+(?:\.\d+)?)$/);
+    return match ? Number(match[1]) : null;
   } catch (_error) {
     return null;
   }
@@ -259,26 +259,16 @@ function safeEvaluate(expression) {
 }
 
 function extractVarLiteral(html, varName) {
-  const marker = `var ${varName}`;
-  const startIndex = html.indexOf(marker);
-  if (startIndex === -1) {
+  const escapedName = varName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const declaration = new RegExp(`\\b(?:var|let|const)\\s+${escapedName}\\s*=\\s*([\\[{])`).exec(html);
+  if (!declaration) {
     return null;
   }
 
-  const equalsIndex = html.indexOf("=", startIndex);
-  if (equalsIndex === -1) {
-    return null;
-  }
-
-  const slice = html.slice(equalsIndex + 1);
-  const firstBracketIndex = slice.search(/[\[{]/);
-  if (firstBracketIndex === -1) {
-    return null;
-  }
-
-  const openChar = slice[firstBracketIndex];
+  const startIndex = declaration.index + declaration[0].length - 1;
+  const openChar = declaration[1];
   const closeChar = openChar === "{" ? "}" : "]";
-  return extractBalancedSection(slice, firstBracketIndex, openChar, closeChar);
+  return extractBalancedSection(html, startIndex, openChar, closeChar);
 }
 
 function normalizeVariantKey(value) {
@@ -405,6 +395,8 @@ function parseAnimeInfoFromHtml(html, domain) {
 function parseEpisodesFromHtml(html, domain, slug) {
   const $ = cheerio.load(html);
   const episodes = [];
+  const expectedHost = new URL(`https://${domain}`).host.replace(/^www\d*\./, "");
+  const expectedPrefix = `${slug}-`;
 
   $("a[href^='/ver/'], a[href*='/ver/']").each((_, element) => {
     const link = $(element).attr("href");
@@ -413,15 +405,23 @@ function parseEpisodesFromHtml(html, domain, slug) {
     }
 
     const url = resolveAbsoluteUrl(link, domain);
-    const number = parseEpisodeNumberFromUrl(url);
-    if (!number) {
+    if (!url) {
       return;
     }
 
-    if (episodes.some((ep) => ep.url === url)) {
+    const parsed = new URL(url);
+    const segments = parsed.pathname.split("/").filter(Boolean);
+    if (!/^https?:$/.test(parsed.protocol) || parsed.host.replace(/^www\d*\./, "") !== expectedHost ||
+        segments.length !== 2 || segments[0] !== "ver" || !segments[1].startsWith(expectedPrefix)) {
       return;
     }
 
+    const episodeSuffix = segments[1].slice(expectedPrefix.length);
+    if (!/^\d+(?:\.\d+)?$/.test(episodeSuffix)) {
+      return;
+    }
+
+    const number = Number(episodeSuffix);
     episodes.push({
       id: null,
       number,
@@ -451,10 +451,10 @@ function parseEpisodeListFromScript(html, domain, slug) {
         return null;
       }
 
-      const number = parseNumber(entry[0]);
-      if (!number && number !== 0) {
+      if (!/^\d+(?:\.\d+)?$/.test(String(entry[0]))) {
         return null;
       }
+      const number = parseNumber(entry[0]);
 
       const episodeSlug = resolvedSlug ? `${resolvedSlug}-${number}` : null;
       const url = episodeSlug ? `https://${domain}/ver/${episodeSlug}` : null;
@@ -565,7 +565,7 @@ async function getAnimeInfo(urlCandidate) {
   let slug = segments[1] || "";
   if (segments[0] === "ver") {
     const rawSlug = segments[1] || "";
-    slug = rawSlug.replace(/-\d+$/, "");
+    slug = rawSlug.replace(/-\d+(?:\.\d+)?$/, "");
   }
 
   if (segments[0] === "anime") {
@@ -580,11 +580,17 @@ async function getAnimeInfo(urlCandidate) {
   const html = await fetchHtml(baseUrl);
 
   const info = parseAnimeInfoFromHtml(html, domain);
-  let episodes = parseEpisodesFromHtml(html, domain, slug);
-
-  if (episodes.length === 0) {
-    episodes = parseEpisodeListFromScript(html, domain, slug);
+  // The page may render only a few episodes while its script contains the full list.
+  const episodesByNumber = new Map();
+  for (const episode of [
+    ...parseEpisodeListFromScript(html, domain, slug),
+    ...parseEpisodesFromHtml(html, domain, slug),
+  ]) {
+    if (!episodesByNumber.has(episode.number)) {
+      episodesByNumber.set(episode.number, episode);
+    }
   }
+  const episodes = [...episodesByNumber.values()].sort((a, b) => a.number - b.number);
 
   return {
     success: true,

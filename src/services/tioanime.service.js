@@ -3,6 +3,7 @@ const cheerio = require("cheerio");
 const vm = require("node:vm");
 const { URL } = require("node:url");
 const { ApiError } = require("../utils/api-error");
+const { normalizeVariant, filterServerLinks, addServerLink } = require("../utils/episode-links");
 
 const DEFAULT_DOMAIN = "tioanime.com";
 
@@ -28,26 +29,11 @@ async function fetchHtml(url) {
   }
 }
 
-function normalizeToken(value) {
-  return (value || "")
-    .toString()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "")
-    .trim();
-}
-
-function normalizeVariantKey(value) {
-  const normalized = normalizeToken(value);
-  if (!normalized) return "SUB";
-  if (normalized.includes("sub") || normalized.includes("jap") || normalized.includes("jp")) return "SUB";
-  return "DUB";
-}
-
 function parseEpisodeNumberFromUrl(url) {
   try {
     const segments = new URL(url).pathname.split("/").filter(Boolean);
     const lastSegment = segments[segments.length - 1] || "";
-    const match = lastSegment.match(/(\d+)$/);
+    const match = lastSegment.match(/-(\d+(?:\.\d+)?)$/);
     return match ? Number(match[1]) : null;
   } catch (_) {
     return null;
@@ -58,35 +44,46 @@ function slugFromUrl(url) {
   try {
     const segments = new URL(url).pathname.split("/").filter(Boolean);
     const lastSegment = segments[segments.length - 1] || "";
-    return lastSegment.replace(/-\d+$/, "");
+    return segments[0] === "ver" ? lastSegment.replace(/-\d+(?:\.\d+)?$/, "") : lastSegment;
   } catch (_) {
     return null;
   }
 }
 
-function parseVideoSources(html) {
-  const match = html.match(/videos\s*=\s*(\[[\s\S]*?\]);/);
+function parseVideoSources(html, baseUrl) {
+  const match = html.match(/\bvideos\s*=\s*([\[{][\s\S]*?[\]}])\s*;/);
   if (!match) return null;
 
   try {
-    const jsonStr = match[1]
-      .replace(/\\\//g, "/")
-      .replace(/\\"/g, '"');
-    const raw = JSON.parse(jsonStr);
-
-    if (!Array.isArray(raw)) return null;
-
+    const raw = vm.runInNewContext(`(${match[1]})`, Object.create(null), {
+      timeout: 1000,
+      contextCodeGeneration: { strings: false, wasm: false },
+    });
     const result = { SUB: [], DUB: [] };
-
-    for (const entry of raw) {
-      if (!Array.isArray(entry) || entry.length < 2) continue;
-      const serverName = entry[0] || "Unknown";
-      const url = entry[1] || null;
-      if (!url) continue;
-
-      result.SUB.push({ server: serverName, url });
-    }
-
+    const collect = (entry, inheritedVariant = "SUB") => {
+      if (!entry || typeof entry !== "object") return;
+      if (Array.isArray(entry)) {
+        if (typeof entry[0] === "string" && typeof entry[1] === "string") {
+          const variant = normalizeVariant(entry[2], normalizeVariant(entry[0], inheritedVariant));
+          addServerLink(result, variant, entry[0], entry[1], baseUrl);
+        } else {
+          entry.forEach((item) => collect(item, inheritedVariant));
+        }
+        return;
+      }
+      const url = entry.url || entry.code || entry.embed || entry.file;
+      if (url) {
+        const server = entry.server || entry.title || "Unknown";
+        const variant = normalizeVariant(entry.variant || entry.language || entry.lang || entry.audio,
+          normalizeVariant(server, inheritedVariant));
+        addServerLink(result, variant, server, url, baseUrl);
+        return;
+      }
+      for (const [key, items] of Object.entries(entry)) {
+        collect(items, normalizeVariant(key, inheritedVariant));
+      }
+    };
+    collect(raw);
     return result;
   } catch (_) {
     return null;
@@ -94,15 +91,17 @@ function parseVideoSources(html) {
 }
 
 function parseEpisodeListFromHtml(html) {
-  const match = html.match(/episodes\s*=\s*(\[[^\]]*\])/);
+  const match = html.match(/\bepisodes\s*=\s*(\[[^\]]*\])/);
   if (!match) return null;
 
   try {
     const raw = JSON.parse(match[1]);
     if (!Array.isArray(raw)) return null;
 
-    return raw
-      .filter((n) => typeof n === "number" && Number.isFinite(n))
+    return [...new Set(raw
+      .filter((n) => (typeof n === "number" || typeof n === "string") && String(n).trim() !== "")
+      .map(Number)
+      .filter((n) => Number.isFinite(n) && n >= 0))]
       .map((n) => ({
         id: null,
         number: n,
@@ -144,11 +143,6 @@ function parseAnimeInfoFromHtml(html) {
   const type = typeEl.text().trim() || null;
 
   return { title, description, genres, type };
-}
-
-function buildLinkRecord(serverName, url, quality) {
-  if (!url) return null;
-  return { server: serverName || "Unknown", url, quality: quality || null };
 }
 
 // Public API
@@ -218,10 +212,13 @@ async function getAnimeInfo(urlCandidate) {
     $("a[href*='/ver/']").each((_, el) => {
       const href = $(el).attr("href");
       if (!href) return;
-      const number = parseEpisodeNumberFromUrl(`https://${DEFAULT_DOMAIN}${href}`);
-      if (number) {
+      try {
+        const episodeUrl = new URL(href, animeUrl);
+        const number = parseEpisodeNumberFromUrl(episodeUrl.href);
+        if (episodeUrl.hostname.replace(/^www\./, "") !== DEFAULT_DOMAIN ||
+            episodeUrl.pathname.replace(/\/$/, "") !== `/ver/${slug}-${number}` || number === null) return;
         episodesList.push({ id: null, number });
-      }
+      } catch (_) {}
     });
     // Dedup
     const seen = new Set();
@@ -234,7 +231,8 @@ async function getAnimeInfo(urlCandidate) {
   }
 
   const episodes = episodesList
-    .filter((ep) => ep && ep.number)
+    .filter((ep) => ep && Number.isFinite(ep.number) && ep.number >= 0)
+    .sort((a, b) => a.number - b.number)
     .map((ep) => ({
       id: ep.id || null,
       number: ep.number,
@@ -268,31 +266,25 @@ async function getAnimeInfo(urlCandidate) {
   };
 }
 
-async function getEpisodeLinks(urlCandidate) {
+async function getEpisodeLinks(urlCandidate, includeMega, excludeServers) {
   const slug = slugFromUrl(urlCandidate);
   const episodeNumber = parseEpisodeNumberFromUrl(urlCandidate);
 
-  if (!slug || !episodeNumber) {
+  if (!slug || episodeNumber === null) {
     throw new ApiError(400, "URL invalida - no se pudo extraer slug y numero");
   }
 
   const episodeUrl = `https://${DEFAULT_DOMAIN}/ver/${slug}-${episodeNumber}`;
   const html = await fetchHtml(episodeUrl);
 
-  const videoSources = parseVideoSources(html);
+  const videoSources = parseVideoSources(html, episodeUrl);
 
   const streamLinks = { SUB: [], DUB: [] };
   const downloadLinks = { SUB: [], DUB: [] };
 
   if (videoSources) {
-    for (const [variantKey, entries] of Object.entries(videoSources)) {
-      for (const entry of entries) {
-        const link = buildLinkRecord(entry.server, entry.url, null);
-        if (link) {
-          const key = normalizeVariantKey(variantKey);
-          streamLinks[key].push(link);
-        }
-      }
+    for (const variant of ["SUB", "DUB"]) {
+      streamLinks[variant] = filterServerLinks(videoSources[variant], includeMega, excludeServers);
     }
   }
 

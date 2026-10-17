@@ -41,6 +41,11 @@ document.addEventListener('DOMContentLoaded', () => {
   const videoLoader = document.getElementById('video-loader');
   const mainPlayer = document.getElementById('main-player');
   const serversList = document.getElementById('servers-list');
+  const variantButtons = {
+    SUB: document.getElementById('variant-sub-btn'),
+    DUB: document.getElementById('variant-dub-btn')
+  };
+  const variantStatus = document.getElementById('variant-status');
   const playerPrevBtn = document.getElementById('player-prev-btn');
   const playerCatalogBtn = document.getElementById('player-catalog-btn');
   const playerExternalBtn = document.getElementById('player-external-btn');
@@ -51,6 +56,11 @@ document.addEventListener('DOMContentLoaded', () => {
   let currentAnimeData = null;
   let currentEpisodeLinks = null;
   let currentEpisodeNumber = null;
+  let preferredVariant = 'SUB';
+  let currentVariant = 'SUB';
+  let playbackVersion = 0;
+  const playbackTimers = new Set();
+  const requests = { info: null, episode: null, resolve: null };
   let catalogPage = 1;
   let catalogGenre = '';
   let catalogTitle = 'Catálogo';
@@ -67,9 +77,28 @@ document.addEventListener('DOMContentLoaded', () => {
     'x-api-key': API_KEY
   });
 
+  function cancelRequest(kind) {
+    if (requests[kind]) requests[kind].abort();
+    requests[kind] = null;
+  }
+
+  function beginRequest(kind) {
+    cancelRequest(kind);
+    const request = new AbortController();
+    requests[kind] = request;
+    return request;
+  }
+
+  function isCurrentRequest(kind, request) {
+    return requests[kind] === request && !request.signal.aborted;
+  }
+
   // --- NAVEGACIÓN Y CAMBIO DE PANTALLAS (SPA) ---
   function switchView(targetPanel) {
+    if (targetPanel !== detailView) cancelRequest('info');
     if (targetPanel !== playerView) {
+      cancelRequest('episode');
+      cancelRequest('resolve');
       stopVideoPlayer();
     }
     
@@ -309,6 +338,10 @@ document.addEventListener('DOMContentLoaded', () => {
   // --- 3. FUNCIÓN: CARGAR DETALLES DEL ANIME ---
   async function loadAnimeDetail(animeUrl) {
     switchView(detailView);
+    const request = beginRequest('info');
+    currentAnimeData = null;
+    currentEpisodeLinks = null;
+    currentEpisodeNumber = null;
     
     animeTitle.textContent = "Cargando detalles...";
     animeDescription.textContent = "Obteniendo información del catálogo...";
@@ -319,9 +352,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
     try {
       const res = await fetch(`/api/v1/anime/info?url=${encodeURIComponent(animeUrl)}`, {
-        headers: getHeaders()
+        headers: getHeaders(),
+        signal: request.signal
       });
       const responseData = await res.json();
+      if (!isCurrentRequest('info', request)) return;
 
       if (responseData.success && responseData.data) {
         currentAnimeData = responseData.data;
@@ -331,6 +366,7 @@ document.addEventListener('DOMContentLoaded', () => {
         animeDescription.textContent = "No se pudo recuperar la información del anime.";
       }
     } catch (err) {
+      if (!isCurrentRequest('info', request)) return;
       console.error('Error al cargar detalle:', err);
       animeTitle.textContent = "Error";
       animeDescription.textContent = "Ocurrió una falla de red al contactar con el backend.";
@@ -370,7 +406,7 @@ document.addEventListener('DOMContentLoaded', () => {
         btn.innerHTML = `<i class="fa-solid fa-play" style="font-size:12px; margin-right:4px;"></i> Ep ${ep.number}`;
         
         btn.addEventListener('click', () => {
-          playEpisode(ep.url, ep.number);
+          if (currentAnimeData === data) playEpisode(ep.url, ep.number);
         });
         
         episodesGrid.appendChild(btn);
@@ -380,343 +416,336 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  // --- 4. FUNCIÓN: OBTENER SERVIDORES Y RESOLUCIÓN MULTI-SERVIDOR EN CASCADA ---
-  async function playEpisode(episodeUrl, episodeNumber) {
-    switchView(playerView);
-    currentEpisodeNumber = episodeNumber;
-    playingTitle.textContent = `${currentAnimeData.title}`;
-    playingSubtitle.textContent = `Cargando Episodio ${episodeNumber}...`;
-    
-    playerExternalBtn.style.display = 'none';
-    playerExternalBtn.href = '#';
-    
-    // Configurar botones de control del reproductor (Anterior / Siguiente / Catálogo)
-    if (currentAnimeData && currentAnimeData.episodes) {
-      const eps = [...currentAnimeData.episodes].sort((a, b) => parseFloat(a.number) - parseFloat(b.number));
-      const currentNum = parseFloat(episodeNumber);
-      const currentIdx = eps.findIndex(ep => parseFloat(ep.number) === currentNum);
-
-      const prevEp = currentIdx > 0 ? eps[currentIdx - 1] : null;
-      const nextEp = currentIdx !== -1 && currentIdx < eps.length - 1 ? eps[currentIdx + 1] : null;
-
-      if (prevEp) {
-        playerPrevBtn.disabled = false;
-        playerPrevBtn.onclick = () => playEpisode(prevEp.url, prevEp.number);
-      } else {
-        playerPrevBtn.disabled = true;
-        playerPrevBtn.onclick = null;
+  // --- 4. EPISODIOS Y SERVIDORES POR IDIOMA ---
+  function normalizeEpisodeServers(data) {
+    const groups = { SUB: [], DUB: [] };
+    for (const variant of Object.keys(groups)) {
+      const seen = new Set();
+      const lists = [data.servers?.[variant.toLowerCase()], data.streamLinks?.[variant]];
+      for (const list of lists) {
+        if (!Array.isArray(list)) continue;
+        for (const server of list) {
+          const url = typeof server?.url === 'string' ? server.url.trim() : '';
+          if (!url || seen.has(url)) continue;
+          seen.add(url);
+          groups[variant].push({ ...server, url, server: server.server || 'Servidor' });
+        }
       }
-
-      if (nextEp) {
-        playerNextBtn.disabled = false;
-        playerNextBtn.onclick = () => playEpisode(nextEp.url, nextEp.number);
-      } else {
-        playerNextBtn.disabled = true;
-        playerNextBtn.onclick = null;
-      }
-
-      playerCatalogBtn.onclick = () => {
-        stopVideoPlayer();
-        switchView(searchView);
-      };
     }
-    
+    return groups;
+  }
+
+  function renderVariantButtons() {
+    for (const [variant, button] of Object.entries(variantButtons)) {
+      const count = currentEpisodeLinks?.[variant].length || 0;
+      const label = variant === 'SUB' ? 'Subtitulado' : 'Doblado';
+      button.textContent = `${variant} · ${label} (${currentEpisodeLinks ? count : '…'})`;
+      button.disabled = !count;
+      button.classList.toggle('active', Boolean(count && currentVariant === variant));
+      button.setAttribute('aria-pressed', String(Boolean(count && currentVariant === variant)));
+    }
+    if (!currentEpisodeLinks) {
+      variantStatus.textContent = 'Consultando disponibilidad de idiomas…';
+      return;
+    }
+    const count = currentEpisodeLinks[currentVariant].length;
+    const unavailable = currentVariant !== preferredVariant
+      ? `${preferredVariant} no disponible para este episodio. ` : '';
+    variantStatus.textContent = count
+      ? `${unavailable}${count} servidor${count === 1 ? '' : 'es'} en ${currentVariant}.`
+      : 'No hay servidores SUB ni DUB disponibles para este episodio.';
+  }
+
+  function showPlayerMessage(message, loading = false) {
+    videoLoader.innerHTML = '';
+    if (loading) {
+      const spinner = document.createElement('div');
+      spinner.className = 'spinner';
+      videoLoader.appendChild(spinner);
+    }
+    const text = document.createElement('p');
+    text.textContent = message;
+    videoLoader.appendChild(text);
     videoLoader.style.opacity = '1';
     videoLoader.style.pointerEvents = 'all';
-    videoLoader.innerHTML = `
-      <div class="spinner"></div>
-      <p>Obteniendo servidores del episodio ${episodeNumber}...</p>
-    `;
-    serversList.innerHTML = '<div style="color:var(--text-muted);">Consultando servidores de video...</div>';
+  }
+
+  function hidePlayerMessage() {
+    videoLoader.style.opacity = '0';
+    videoLoader.style.pointerEvents = 'none';
+  }
+
+  function showPlaybackStatus(serverName, embedded = false) {
+    playingSubtitle.textContent = `Episodio ${currentEpisodeNumber} · ${currentVariant} — ${serverName}${embedded ? ' (reproductor externo)' : ''}`;
+  }
+
+  async function playEpisode(episodeUrl, episodeNumber) {
+    const anime = currentAnimeData;
+    if (!anime || !anime.episodes?.some(ep => ep.url === episodeUrl)) return;
+    switchView(playerView);
+    cancelRequest('resolve');
+    stopVideoPlayer();
+    const request = beginRequest('episode');
+    currentEpisodeLinks = null;
+    currentEpisodeNumber = episodeNumber;
+    playingTitle.textContent = anime.title;
+    playingSubtitle.textContent = `Cargando Episodio ${episodeNumber}...`;
+    renderVariantButtons();
+
+    const eps = [...anime.episodes].sort((a, b) => Number(a.number) - Number(b.number));
+    const currentIdx = eps.findIndex(ep => ep.url === episodeUrl);
+    const prevEp = currentIdx > 0 ? eps[currentIdx - 1] : null;
+    const nextEp = currentIdx >= 0 ? eps[currentIdx + 1] : null;
+    for (const [button, episode] of [[playerPrevBtn, prevEp], [playerNextBtn, nextEp]]) {
+      button.disabled = !episode;
+      button.onclick = episode ? () => {
+        if (currentAnimeData === anime) playEpisode(episode.url, episode.number);
+      } : null;
+    }
+    playerCatalogBtn.onclick = () => switchView(searchView);
+
+    showPlayerMessage(`Obteniendo servidores del episodio ${episodeNumber}...`, true);
+    serversList.textContent = 'Consultando servidores de video...';
 
     try {
       const res = await fetch(`/api/v1/anime/episode?url=${encodeURIComponent(episodeUrl)}`, {
-        headers: getHeaders()
+        headers: getHeaders(), signal: request.signal
       });
       const responseData = await res.json();
-
-      if (responseData.success && responseData.data?.servers?.sub) {
-        currentEpisodeLinks = responseData.data.servers.sub;
-        resolveMultiServer(currentEpisodeLinks);
-      } else {
-        playingSubtitle.textContent = "Error al obtener servidores";
-        videoLoader.innerHTML = '<i class="fa-solid fa-face-frown" style="font-size:36px; color:var(--accent-purple);"></i> <p>No se encontraron servidores de streaming para este episodio.</p>';
-      }
+      if (!isCurrentRequest('episode', request)) return;
+      if (!responseData.success || !responseData.data) throw new Error('No se encontraron servidores');
+      currentEpisodeLinks = normalizeEpisodeServers(responseData.data);
+      currentVariant = currentEpisodeLinks[preferredVariant].length ? preferredVariant
+        : currentEpisodeLinks.SUB.length ? 'SUB' : currentEpisodeLinks.DUB.length ? 'DUB' : preferredVariant;
+      renderVariantButtons();
+      resolveMultiServer(currentEpisodeLinks[currentVariant]);
     } catch (err) {
-      console.error('Error al obtener servidores:', err);
-      playingSubtitle.textContent = "Error de red";
-      videoLoader.innerHTML = '<i class="fa-solid fa-triangle-exclamation" style="font-size:36px; color:#ff3838;"></i> <p>Falla al contactar con la API.</p>';
+      if (!isCurrentRequest('episode', request)) return;
+      currentEpisodeLinks = { SUB: [], DUB: [] };
+      renderVariantButtons();
+      serversList.textContent = '';
+      playingSubtitle.textContent = 'No se pudieron obtener los servidores';
+      showPlayerMessage('No se pudieron cargar los servidores de este episodio. Vuelve a seleccionarlo para reintentar.');
     }
   }
 
-  // Resolución multi-servidor en cascada:
-  // Recopila TODOS los servidores soportados y envía sus URLs al backend.
-  // El backend los prueba en orden y devuelve el primer resultado exitoso.
-  async function resolveMultiServer(servers) {
-    // Identificar servidores soportados (que tienen resolutor nativo)
-    const supportedServers = servers.filter(s => {
-      const n = (s.server || '').toLowerCase() + ' ' + (s.url || '').toLowerCase();
-      return n.includes('voe') || n.includes('wish') || n.includes('tape') || n.includes('playnix') || n.includes('medix') || n.includes('awish');
+  for (const [variant, button] of Object.entries(variantButtons)) {
+    button.addEventListener('click', () => {
+      if (!currentEpisodeLinks?.[variant].length || currentVariant === variant) return;
+      preferredVariant = variant;
+      currentVariant = variant;
+      renderVariantButtons();
+      resolveMultiServer(currentEpisodeLinks[variant]);
     });
+  }
 
-    // Renderizar TODOS los botones de servidor (soportados + no soportados)
-    renderAllServerButtons(servers, supportedServers);
+  function isDirectMedia(url) {
+    return /\.(?:m3u8|mp4)(?:[?#]|$)/i.test(url);
+  }
 
-    if (supportedServers.length === 0) {
-      // Sin servidores soportados: ir directo a iframe con el primero disponible
-      if (servers.length > 0) {
-        playingSubtitle.textContent = `Reproduciendo Episodio ${currentEpisodeNumber} (Iframe: ${servers[0].server})`;
-        loadIframePlayer(servers[0].url);
-      } else {
-        videoLoader.innerHTML = '<p>No hay reproductores disponibles.</p>';
-      }
+  function supportsDirectResolution(server) {
+    return /voe|wish|tape|playnix|medix|niramirus|kravaxxa|davioad|haxlopp|tryzendm|dumbalag|dhcplay|hglink|vidhide|hqq|netu|waaw|mixdrop|mxdcontent|dood|dstream|ds2play|dropload|dr0pstream|drop\.download|mp4upload/i.test(`${server.server} ${server.url}`);
+  }
+
+  function setServerStates(servers, activeUrl = null, tryingUrls = []) {
+    serversList.querySelectorAll('.server-btn').forEach(button => {
+      const server = servers[Number(button.getAttribute('data-idx'))];
+      button.classList.toggle('active', server?.url === activeUrl);
+      button.classList.toggle('server-trying', tryingUrls.includes(server?.url));
+    });
+  }
+
+  // Promise.any devuelve el primero que responde; no informa cuáles fallaron.
+  async function resolveMultiServer(servers) {
+    cancelRequest('resolve');
+    stopVideoPlayer();
+    renderAllServerButtons(servers);
+    if (!servers.length) {
+      playingSubtitle.textContent = `Episodio ${currentEpisodeNumber} · Sin servidores`;
+      showPlayerMessage('No hay reproductores disponibles para este episodio.');
       return;
     }
 
-    // Mostrar progreso visual
-    videoLoader.innerHTML = `
-      <div class="spinner"></div>
-      <p>Probando ${supportedServers.length} servidor${supportedServers.length > 1 ? 'es' : ''} en cascada para encontrar el mejor stream sin anuncios...</p>
-    `;
-    videoLoader.style.opacity = '1';
-    videoLoader.style.pointerEvents = 'all';
+    const direct = servers.find(server => isDirectMedia(server.url));
+    if (direct) {
+      setServerStates(servers, direct.url);
+      showPlaybackStatus(direct.server);
+      hidePlayerMessage();
+      startVideoPlayer(direct.url, /\.m3u8(?:[?#]|$)/i.test(direct.url) ? 'hls' : 'mp4', direct.url);
+      return;
+    }
 
-    // Marcar todos como "trying" visualmente
-    supportedServers.forEach((s, i) => {
-      const btn = document.querySelector(`.server-btn[data-idx="${servers.indexOf(s)}"]`);
-      if (btn && i === 0) btn.classList.add('server-trying');
-    });
+    const supportedServers = servers.filter(supportsDirectResolution);
+    if (!supportedServers.length) {
+      setServerStates(servers, servers[0].url);
+      showPlaybackStatus(servers[0].server, true);
+      loadIframePlayer(servers[0].url);
+      return;
+    }
 
-    // Enviar TODOS los URLs soportados al backend para cascada
-    const urlsArray = supportedServers.map(s => s.url);
-
+    const request = beginRequest('resolve');
+    const urls = supportedServers.map(server => server.url);
+    showPlayerMessage(`Buscando reproducción directa en ${supportedServers.length} servidor${supportedServers.length === 1 ? '' : 'es'} de ${currentVariant}...`, true);
+    setServerStates(servers, null, urls);
     try {
-      const res = await fetch(`/api/v1/anime/resolve?urls=${encodeURIComponent(JSON.stringify(urlsArray))}`, {
-        headers: getHeaders()
+      const res = await fetch(`/api/v1/anime/resolve?urls=${encodeURIComponent(JSON.stringify(urls))}`, {
+        headers: getHeaders(), signal: request.signal
       });
       const responseData = await res.json();
-
-      // Limpiar clases de estado en botones
-      document.querySelectorAll('.server-btn').forEach(b => {
-        b.classList.remove('server-trying');
-      });
-
-      if (responseData.success && responseData.streamUrl) {
-        const streamUrl = responseData.streamUrl;
-        const mediaType = responseData.mediaType;
-        const resolvedFrom = responseData.resolvedFrom || '';
-        
-        // Marcar el servidor exitoso como activo
-        const winnerIdx = servers.findIndex(s => s.url === resolvedFrom);
-        if (winnerIdx !== -1) {
-          const winBtn = document.querySelector(`.server-btn[data-idx="${winnerIdx}"]`);
-          if (winBtn) winBtn.classList.add('active');
-        }
-
-        // Marcar los que fallaron (los que están antes del ganador en la lista soportada)
-        const winnerSupportedIdx = supportedServers.findIndex(s => s.url === resolvedFrom);
-        for (let i = 0; i < winnerSupportedIdx; i++) {
-          const failIdx = servers.indexOf(supportedServers[i]);
-          const failBtn = document.querySelector(`.server-btn[data-idx="${failIdx}"]`);
-          if (failBtn) failBtn.classList.add('server-failed');
-        }
-
-        console.log(`[CASCADA] Stream resuelto exitosamente desde: ${resolvedFrom}`);
-        playingSubtitle.textContent = `Streaming Directo Limpio (${responseData.server}) — Capítulo ${currentEpisodeNumber}`;
-        
-        videoLoader.style.opacity = '0';
-        videoLoader.style.pointerEvents = 'none';
-
-        startVideoPlayer(streamUrl, mediaType, servers[0]?.url);
-      } else {
-        throw new Error("Cascada agotada — ningún servidor devolvió stream");
-      }
+      if (!isCurrentRequest('resolve', request)) return;
+      const winner = supportedServers.find(server => server.url === responseData.resolvedFrom);
+      if (!responseData.success || !responseData.streamUrl || !winner) throw new Error('No se devolvió un stream del grupo seleccionado');
+      setServerStates(servers, winner.url);
+      showPlaybackStatus(winner.server);
+      hidePlayerMessage();
+      startVideoPlayer(responseData.streamUrl, responseData.mediaType, winner.url);
     } catch (err) {
-      console.warn(`[CASCADA] Todos los servidores fallaron:`, err.message);
-      
-      // Marcar todos los soportados como fallidos
-      document.querySelectorAll('.server-btn').forEach(b => {
-        b.classList.remove('server-trying');
-      });
-      supportedServers.forEach(s => {
-        const idx = servers.indexOf(s);
-        const btn = document.querySelector(`.server-btn[data-idx="${idx}"]`);
-        if (btn) btn.classList.add('server-failed');
-      });
-
-      // Fallback: cargar el primer servidor disponible en iframe
-      playingSubtitle.textContent = `Reproduciendo Episodio ${currentEpisodeNumber} (Iframe de Respaldo)`;
+      if (!isCurrentRequest('resolve', request)) return;
+      // Una falla de resolución directa no impide usar o reintentar el embed.
+      setServerStates(servers, servers[0].url);
+      showPlaybackStatus(servers[0].server, true);
       loadIframePlayer(servers[0].url);
     }
   }
 
-  // Renderizar la lista de botones de servidor
-  function renderAllServerButtons(allServers, supportedServers) {
+  function renderAllServerButtons(servers) {
     serversList.innerHTML = '';
-    
-    allServers.forEach((s, idx) => {
-      const isSupported = supportedServers.includes(s);
-      const btn = document.createElement('button');
-      btn.className = 'server-btn';
-      btn.setAttribute('data-idx', idx);
-      
-      if (isSupported) {
-        btn.innerHTML = `<i class="fa-solid fa-bolt"></i> ${s.server} (Sin Anuncios)`;
-      } else {
-        btn.innerHTML = `<i class="fa-solid fa-external-link"></i> ${s.server} (Iframe)`;
-      }
-      
-      btn.addEventListener('click', () => {
-        // Clic manual: resolver este servidor individual
-        document.querySelectorAll('.server-btn').forEach(b => b.classList.remove('active', 'server-trying'));
-        btn.classList.add('active');
-        
-        if (isSupported) {
-          resolveSingleServer(s.url, s.server);
+    const episodeRequest = requests.episode;
+    servers.forEach((server, idx) => {
+      const button = document.createElement('button');
+      button.className = 'server-btn';
+      button.setAttribute('data-idx', idx);
+      button.textContent = server.server;
+      button.addEventListener('click', () => {
+        if (requests.episode !== episodeRequest || currentEpisodeLinks?.[currentVariant] !== servers) return;
+        cancelRequest('resolve');
+        stopVideoPlayer();
+        setServerStates(servers, server.url);
+        if (isDirectMedia(server.url)) {
+          showPlaybackStatus(server.server);
+          hidePlayerMessage();
+          startVideoPlayer(server.url, /\.m3u8(?:[?#]|$)/i.test(server.url) ? 'hls' : 'mp4', server.url);
+        } else if (supportsDirectResolution(server)) {
+          resolveSingleServer(server, servers);
         } else {
-          playingSubtitle.textContent = `Reproduciendo Episodio ${currentEpisodeNumber} (Iframe: ${s.server})`;
-          loadIframePlayer(s.url);
+          showPlaybackStatus(server.server, true);
+          loadIframePlayer(server.url);
         }
       });
-      
-      serversList.appendChild(btn);
+      serversList.appendChild(button);
     });
   }
 
-  // Resolución de un servidor individual (clic manual)
-  async function resolveSingleServer(embedUrl, serverName) {
-    videoLoader.innerHTML = `
-      <div class="spinner"></div>
-      <p>Resolviendo enlace nativo de <strong>${serverName}</strong>...</p>
-    `;
-    videoLoader.style.opacity = '1';
-    videoLoader.style.pointerEvents = 'all';
-    stopVideoPlayer();
-
+  async function resolveSingleServer(server, servers) {
+    const request = beginRequest('resolve');
+    showPlayerMessage(`Resolviendo ${server.server} en ${currentVariant}...`, true);
+    setServerStates(servers, server.url, [server.url]);
     try {
-      const res = await fetch(`/api/v1/anime/resolve?url=${encodeURIComponent(embedUrl)}`, {
-        headers: getHeaders()
+      const res = await fetch(`/api/v1/anime/resolve?url=${encodeURIComponent(server.url)}`, {
+        headers: getHeaders(), signal: request.signal
       });
       const responseData = await res.json();
-
-      if (responseData.success && responseData.streamUrl) {
-        console.log(`[STREAMING] Enlace directo resuelto: ${responseData.streamUrl}`);
-        playingSubtitle.textContent = `Streaming Directo (${serverName}) — Capítulo ${currentEpisodeNumber}`;
-        
-        videoLoader.style.opacity = '0';
-        videoLoader.style.pointerEvents = 'none';
-        startVideoPlayer(responseData.streamUrl, responseData.mediaType, embedUrl);
-      } else {
-        throw new Error("No se devolvió un enlace válido");
+      if (!isCurrentRequest('resolve', request)) return;
+      if (!responseData.success || !responseData.streamUrl || (responseData.resolvedFrom && responseData.resolvedFrom !== server.url)) {
+        throw new Error('No se devolvió un enlace del servidor seleccionado');
       }
+      setServerStates(servers, server.url);
+      showPlaybackStatus(server.server);
+      hidePlayerMessage();
+      startVideoPlayer(responseData.streamUrl, responseData.mediaType, server.url);
     } catch (err) {
-      console.warn(`[RESOLVER] Falló resolución de ${serverName}:`, err.message);
-      playingSubtitle.textContent = `Reproduciendo Episodio ${currentEpisodeNumber} (Iframe: ${serverName})`;
-      loadIframePlayer(embedUrl);
+      if (!isCurrentRequest('resolve', request)) return;
+      setServerStates(servers, server.url);
+      showPlaybackStatus(server.server, true);
+      loadIframePlayer(server.url);
     }
   }
 
-  // --- 5. CONTROLES DEL REPRODUCTOR MULTIMEDIA ---
+  // --- 5. REPRODUCCIÓN: CADA SELECCIÓN INVALIDA LOS EVENTOS ANTERIORES ---
   function startVideoPlayer(url, mediaType, fallbackUrl = null) {
     stopVideoPlayer();
-
+    const version = playbackVersion;
+    const isCurrent = () => version === playbackVersion;
     if (fallbackUrl) {
       playerExternalBtn.style.display = 'flex';
       playerExternalBtn.href = fallbackUrl;
-    } else {
-      playerExternalBtn.style.display = 'none';
     }
-
-    const iframe = document.getElementById('iframe-player');
-    if (iframe) iframe.remove();
     mainPlayer.style.display = 'block';
 
     let fallbackTriggered = false;
     const triggerFallback = () => {
-      if (fallbackTriggered) return;
+      if (!isCurrent() || fallbackTriggered) return;
       fallbackTriggered = true;
       if (fallbackUrl) {
-        console.warn(`[PLAYER] Fallback automático a iframe: ${fallbackUrl}`);
-        playingSubtitle.textContent = `Reproduciendo Episodio ${currentEpisodeNumber} (Iframe de Respaldo)`;
+        playingSubtitle.textContent = `Episodio ${currentEpisodeNumber} · ${currentVariant} — Reproductor externo`;
         loadIframePlayer(fallbackUrl);
       } else {
         stopVideoPlayer();
+        showPlayerMessage('No se pudo reproducir el video. Prueba otro servidor.');
       }
     };
-
-    mainPlayer.onerror = () => {
-      console.warn('[HTML5 Video] Error nativo detectado');
-      triggerFallback();
+    const playIfCurrent = () => {
+      if (isCurrent()) mainPlayer.play().catch(() => {});
     };
+    mainPlayer.onerror = triggerFallback;
 
     if (mediaType === 'hls') {
-      if (Hls.isSupported()) {
-        console.log('[HLS.js] Inicializando streaming HLS...');
-        hlsInstance = new Hls({
+      if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+        const instance = new Hls({
           maxMaxBufferLength: 30,
           enableWorker: true,
           manifestLoadingMaxRetry: 3,
           levelLoadingMaxRetry: 3,
           fragLoadingMaxRetry: 3
         });
-        hlsInstance.loadSource(url);
-        hlsInstance.attachMedia(mainPlayer);
-        hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
-          mainPlayer.play().catch(() => console.log("Auto-play bloqueado"));
-        });
-
-        hlsInstance.on(Hls.Events.ERROR, function (event, data) {
-          if (data.fatal) {
-            switch (data.type) {
-              case Hls.ErrorTypes.NETWORK_ERROR:
-                console.log("[HLS] Error de red fatal, reintentando...");
-                hlsInstance.startLoad();
-                setTimeout(() => {
-                  if (mainPlayer.paused || mainPlayer.readyState === 0) {
-                    triggerFallback();
-                  }
-                }, 4000);
-                break;
-              case Hls.ErrorTypes.MEDIA_ERROR:
-                console.log("[HLS] Error multimedia, recuperando...");
-                hlsInstance.recoverMediaError();
-                break;
-              default:
-                triggerFallback();
-                break;
-            }
+        hlsInstance = instance;
+        instance.on(Hls.Events.MANIFEST_PARSED, playIfCurrent);
+        instance.on(Hls.Events.ERROR, (event, data) => {
+          if (!isCurrent() || hlsInstance !== instance || !data.fatal) return;
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            instance.startLoad();
+            const timer = setTimeout(() => {
+              playbackTimers.delete(timer);
+              if (isCurrent() && (mainPlayer.paused || mainPlayer.readyState === 0)) triggerFallback();
+            }, 4000);
+            playbackTimers.add(timer);
+          } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            instance.recoverMediaError();
+          } else {
+            triggerFallback();
           }
         });
-      } 
-      else if (mainPlayer.canPlayType('application/vnd.apple.mpegurl')) {
+        instance.loadSource(url);
+        instance.attachMedia(mainPlayer);
+      } else if (mainPlayer.canPlayType('application/vnd.apple.mpegurl')) {
+        mainPlayer.onloadedmetadata = playIfCurrent;
         mainPlayer.src = url;
-        mainPlayer.addEventListener('loadedmetadata', () => {
-          mainPlayer.play().catch(() => {});
-        });
+        mainPlayer.load();
       } else {
         triggerFallback();
       }
-    } 
-    else {
+    } else {
+      mainPlayer.oncanplay = playIfCurrent;
       mainPlayer.src = url;
       mainPlayer.load();
-      mainPlayer.addEventListener('canplay', () => {
-        mainPlayer.play().catch(() => {});
-      });
     }
   }
 
   function stopVideoPlayer() {
+    playbackVersion++;
+    playbackTimers.forEach(timer => clearTimeout(timer));
+    playbackTimers.clear();
+    mainPlayer.onerror = null;
+    mainPlayer.oncanplay = null;
+    mainPlayer.onloadedmetadata = null;
+    const instance = hlsInstance;
+    hlsInstance = null;
+    if (instance) instance.destroy();
     mainPlayer.pause();
     mainPlayer.removeAttribute('src');
     mainPlayer.load();
-    mainPlayer.onerror = null;
-
-    if (hlsInstance) {
-      hlsInstance.destroy();
-      hlsInstance = null;
-    }
-
+    playerExternalBtn.style.display = 'none';
+    playerExternalBtn.href = '#';
     const iframe = document.getElementById('iframe-player');
     if (iframe) {
       iframe.src = 'about:blank';
@@ -727,27 +756,20 @@ document.addEventListener('DOMContentLoaded', () => {
   function loadIframePlayer(embedUrl) {
     stopVideoPlayer();
     mainPlayer.style.display = 'none';
-
-    const oldIframe = document.getElementById('iframe-player');
-    if (oldIframe) oldIframe.remove();
-
     const iframe = document.createElement('iframe');
     iframe.id = 'iframe-player';
     iframe.src = embedUrl;
-    
     playerExternalBtn.style.display = 'flex';
     playerExternalBtn.href = embedUrl;
+    iframe.title = `Reproductor ${currentVariant} del episodio ${currentEpisodeNumber}`;
     iframe.style.position = 'absolute';
     iframe.style.top = '0';
     iframe.style.left = '0';
     iframe.style.width = '100%';
     iframe.style.height = '100%';
     iframe.setAttribute('allowfullscreen', 'true');
-
     document.getElementById('video-container').appendChild(iframe);
-    
-    videoLoader.style.opacity = '0';
-    videoLoader.style.pointerEvents = 'none';
+    hidePlayerMessage();
   }
 
   // --- FILTROS DE GÉNERO ---
